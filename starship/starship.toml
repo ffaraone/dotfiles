@@ -6,7 +6,7 @@ add_newline = true
 # Line 1: left (git, venv, cwd) + right (k8s, battery, time)
 # Line 2: prompt symbol only
 format = """
-$git_branch($git_status)( ≻$python)( ≻$directory)$fill(≺$kubernetes )(≺$battery )(≺$time)
+($git_branch$git_commit)($git_status)( ≻$python)( ≻$directory)$fill(≺$kubernetes )(≺$battery )(≺$time)
 $character
 """
 
@@ -22,12 +22,24 @@ format = " [$path]($style)[$read_only]($read_only_style) "
 
 [git_branch]
 format = " [$symbol$branch]($style)"
-symbol = " " # SCM_GIT_CHAR
 style = "bold fg:#005f5f" # SCM_THEME_PROMPT_CLEAN_COLOR=25
 
 [git_status]
-format = " [$all_status$ahead_behind]($style)"
+format = " [$ahead_behind$staged$modified$untracked]($style)"
 style = "fg:#870000" # SCM_THEME_PROMPT_DIRTY_COLOR=88
+ahead = '⇡${count}'
+behind = '⇣${count}'
+diverged = '⇕⇡${ahead_count}⇣${behind_count}'
+staged = ' ✚${count}'
+modified = ' ~${count}'
+untracked = ' ?${count}'
+
+[git_commit]
+format = " [@$hash]($style)"
+commit_hash_length = 7
+only_detached = false
+tag_disabled = true
+style = "fg:#585858 dimmed"
 
 [python]
 format = " [$symbol$virtualenv](style)"
