@@ -26,13 +26,13 @@ style = "bold fg:#005f5f" # SCM_THEME_PROMPT_CLEAN_COLOR=25
 
 [git_status]
 format = "[$ahead_behind$staged$modified$untracked]($style)"
-style = "fg:#870000" # SCM_THEME_PROMPT_DIRTY_COLOR=88
-ahead = '⇡${count}'
-behind = '⇣${count}'
-diverged = '⇕⇡${ahead_count}⇣${behind_count}'
-staged = ' ✚${count}'
-modified = ' ~${count}'
-untracked = ' ?${count}'
+style = "" # use per-part styles below
+ahead = '[⇡${count}](bold fg:#5faf00)'
+behind = '[⇣${count}](bold fg:#00afff)'
+diverged = '[⇕⇡${ahead_count}⇣${behind_count}](bold fg:#ffaf00)'
+staged = '[✚${count}](fg:#5f87ff)'
+modified = '[~${count}](fg:#ff5f5f)'
+untracked = '[?${count}](fg:#af87ff)'
 
 [git_commit]
 format = "[@$hash]($style)"
@@ -68,7 +68,6 @@ style = 'bold fg:#ffaf00'
 [[battery.display]] # show battery for anything up to 100%
 threshold = 100
 style = 'bold fg:#5faf00'
-
 
 [time]
 disabled = false
