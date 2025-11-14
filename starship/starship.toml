@@ -6,7 +6,7 @@ add_newline = true
 # Line 1: left (git, venv, cwd) + right (k8s, battery, time)
 # Line 2: prompt symbol only
 format = """
-$git_branch( ≻$git_status)( ≻$python)( ≻$directory)$fill(≺$kubernetes )(≺$battery )(≺$time)
+$git_branch($git_status)( ≻$python)( ≻$directory)$fill(≺$kubernetes )(≺$battery )(≺$time)
 $character
 """
 
