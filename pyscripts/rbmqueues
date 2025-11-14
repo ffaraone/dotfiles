@@ -1,0 +1,395 @@
+#!/usr/bin/env -S uv run --script
+
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["rich", "typer", "pyyaml"]
+# ///
+
+from __future__ import annotations
+
+import re
+import subprocess
+from dataclasses import dataclass
+import json
+from pathlib import Path
+from typing import Dict, Optional
+
+import typer
+from rich.console import Console
+from rich.table import Table
+from rich import box
+from rich.text import Text
+from rich.syntax import Syntax
+from rich.panel import Panel
+
+try:
+	import yaml  # type: ignore
+except Exception:  # pragma: no cover - handled gracefully
+	yaml = None
+
+app = typer.Typer(add_completion=False, help="RabbitMQ queue viewer with optional thresholds")
+console = Console()
+
+
+@dataclass
+class Threshold:
+	warn: int
+	crit: int
+	consumers: Optional[int] = None
+
+	@classmethod
+	def from_mapping(cls, data: Dict) -> "Threshold":
+		try:
+			warn = int(data.get("warn", 0))
+			crit = int(data.get("crit", 0))
+			exp = data.get("consumers")
+			expected = int(exp) if exp is not None and str(exp) != "" else None
+			return cls(warn, crit, expected)
+		except ValueError as e:  # pragma: no cover
+			raise ValueError(f"Invalid threshold values: {data}") from e
+
+
+def load_thresholds(path: Optional[Path]) -> Dict[str, Threshold]:
+	if path is None:
+		return {}
+	if not path.exists():
+		console.print(f"[red]Error:[/red] thresholds file not found: {path}")
+		raise typer.Exit(3)
+	if yaml is None:
+		console.print("[red]Error:[/red] PyYAML not installed. Install with `uv add pyyaml` or `pip install pyyaml`.")
+		raise typer.Exit(1)
+	try:
+		data = yaml.safe_load(path.read_text()) or {}
+	except Exception as e:  # pragma: no cover
+		console.print(f"[red]Error parsing YAML:[/red] {e}")
+		raise typer.Exit(3)
+	thresholds: Dict[str, Threshold] = {}
+	for qname, mapping in (data.get("queues") or {}).items():  # type: ignore
+		if not isinstance(mapping, dict):
+			continue
+		try:
+			thresholds[qname] = Threshold.from_mapping(mapping)
+		except ValueError as e:  # pragma: no cover
+			console.print(f"[yellow]Skipping invalid threshold for {qname}:[/yellow] {e}")
+	return thresholds
+
+
+# --- Config management (YAML under ~/.config/rbmqueues/config.yaml) ---
+CONFIG_DIR = Path.home() / ".config" / "rbmqueues"
+CONFIG_FILE = CONFIG_DIR / "config.yaml"
+
+
+def _empty_config() -> Dict:
+	return {"profiles": {}}
+
+
+def load_config() -> Dict:
+	if not CONFIG_FILE.exists():
+		return _empty_config()
+	if yaml is None:
+		console.print("[red]Error:[/red] PyYAML not installed. Cannot read config.")
+		raise typer.Exit(1)
+	try:
+		data = yaml.safe_load(CONFIG_FILE.read_text()) or {}
+	except Exception as e:  # pragma: no cover
+		console.print(f"[red]Error reading config:[/red] {e}")
+		raise typer.Exit(1)
+	if not isinstance(data, dict):
+		return _empty_config()
+	data.setdefault("profiles", {})
+	return data
+
+
+def save_config(cfg: Dict) -> None:
+	if yaml is None:
+		console.print("[red]Error:[/red] PyYAML not installed. Cannot write config.")
+		raise typer.Exit(1)
+	CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+	try:
+		CONFIG_FILE.write_text(yaml.safe_dump(cfg, sort_keys=True))
+	except Exception as e:  # pragma: no cover
+		console.print(f"[red]Error writing config:[/red] {e}")
+		raise typer.Exit(1)
+
+
+def thresholds_from_profile(profile: str) -> Dict[str, Threshold]:
+	cfg = load_config()
+	profiles = cfg.get("profiles") or {}
+	pdata = profiles.get(profile)
+	if not isinstance(pdata, dict):
+		console.print(f"[red]Error:[/red] Profile not found: {profile}")
+		raise typer.Exit(3)
+	res: Dict[str, Threshold] = {}
+	for qname, mapping in (pdata.get("queues") or {}).items():
+		if not isinstance(mapping, dict):
+			continue
+		res[qname] = Threshold.from_mapping(mapping)
+	return res
+
+
+# Subcommands for managing config
+config_app = typer.Typer(help="Manage highlight profiles and queues")
+
+
+@config_app.command("show", help="Show full config or a specific profile")
+def config_show(
+	profile: Optional[str] = typer.Option(None, "--profile", "-p", help="Profile name to show"),
+):
+	cfg = load_config()
+	if profile:
+		profiles = cfg.get("profiles") or {}
+		pdata = profiles.get(profile)
+		if pdata is None:
+			console.print(f"[red]Profile not found:[/red] {profile}")
+			raise typer.Exit(3)
+		if yaml is None:
+			j = json.dumps({profile: pdata}, indent=2)
+			body = Syntax(j, "json")
+		else:
+			y = yaml.safe_dump({profile: pdata}, sort_keys=True)
+			body = Syntax(y, "yaml")
+		title = f"Profile {profile}"
+		console.print(Panel(body, title=title, box=box.ROUNDED, border_style="blue", title_align="left"))
+	else:
+		if yaml is None:
+			j = json.dumps(cfg, indent=2)
+			body = Syntax(j, "json")
+		else:
+			y = yaml.safe_dump(cfg, sort_keys=True)
+			body = Syntax(y, "yaml")
+		title = "Global Configuration"
+		console.print(Panel(body, title=title, box=box.ROUNDED, border_style="blue", title_align="left"))
+
+
+@config_app.command("list", help="List available profile names")
+def config_list():
+	cfg = load_config()
+	profiles = cfg.get("profiles") or {}
+	table = Table(title="Profiles", box=box.ROUNDED, border_style="blue", header_style="bold cyan")
+	table.add_column("Profile")
+	table.add_column("Queues", justify="right")
+	for name in sorted(profiles.keys()):
+		queues = profiles.get(name, {}).get("queues", {})
+		count = len(queues) if isinstance(queues, dict) else 0
+		table.add_row(name, str(count))
+	console.print(table)
+
+
+@config_app.command("set", help="Create/update a queue entry in a profile")
+def config_set(
+	profile: str = typer.Option(..., "--profile", "-p", help="Profile name"),
+	queue: str = typer.Option(..., "--queue", "-q", help="Queue name"),
+	warn: Optional[int] = typer.Option(None, "--warn", "-w", help="Warn threshold for ready messages"),
+	crit: Optional[int] = typer.Option(None, "--crit", "-c", help="Critical threshold for ready messages"),
+	consumers: Optional[int] = typer.Option(None, "--consumers", "-n", help="Expected number of consumers"),
+):
+	cfg = load_config()
+	cfg.setdefault("profiles", {})
+	prof = cfg["profiles"].setdefault(profile, {})
+	prof.setdefault("queues", {})
+	entry = prof["queues"].get(queue, {})
+	# Update only provided fields
+	if warn is not None:
+		entry["warn"] = int(warn)
+	if crit is not None:
+		entry["crit"] = int(crit)
+	if consumers is not None:
+		entry["consumers"] = int(consumers)
+	prof["queues"][queue] = entry
+	save_config(cfg)
+	console.print(f"[green]Updated[/green] profile='{profile}' queue='{queue}' → {entry}")
+
+
+# Add the config sub-app under the main CLI
+app.add_typer(config_app, name="config")
+
+
+# Optional convenience alias: top-level `set` (maps to config set)
+@app.command("set", help="Alias for: rbmqueues config set …")
+def top_level_set(
+	profile: str = typer.Option(..., "--profile", "-p"),
+	queue: str = typer.Option(..., "--queue", "-q"),
+	warn: Optional[int] = typer.Option(None, "--warn", "-w"),
+	crit: Optional[int] = typer.Option(None, "--crit", "-c"),
+	consumers: Optional[int] = typer.Option(None, "--consumers", "-n"),
+):
+	return config_set(profile=profile, queue=queue, warn=warn, crit=crit, consumers=consumers)
+
+
+def detect_rabbitmq_pod() -> Optional[str]:
+	# First attempt: label selector used by modern charts
+	try:
+		pod = subprocess.check_output(
+			[
+				"kubectl",
+				"get",
+				"pods",
+				"-l",
+				"app.kubernetes.io/name=rabbitmq",
+				"-o",
+				"jsonpath={.items[0].metadata.name}",
+			],
+			text=True,
+			stderr=subprocess.DEVNULL,
+		).strip()
+		if pod:
+			return pod
+	except subprocess.CalledProcessError:
+		pass
+
+	# Fallback: list pods, pick first matching legacy pattern
+	try:
+		listing = subprocess.check_output(["kubectl", "get", "pods"], text=True, stderr=subprocess.DEVNULL)
+	except subprocess.CalledProcessError:
+		return None
+	for line in listing.splitlines():
+		parts = line.split()
+		if not parts:
+			continue
+		name = parts[0]
+		if re.search(r"rabbitmq-server-", name):
+			return name
+	return None
+
+
+def list_queues(pod: str) -> list[Dict[str, str]]:
+	try:
+		output = subprocess.check_output(
+			[
+				"kubectl",
+				"exec",
+				pod,
+				"-c",
+				"rabbitmq",
+				"--",
+				"rabbitmqctl",
+				"-s",
+				"list_queues",
+				"name",
+				"messages_ready",
+				"messages_unacknowledged",
+				"consumers",
+			],
+			text=True,
+			stderr=subprocess.DEVNULL,
+		)
+	except subprocess.CalledProcessError:
+		console.print("[red]Error:[/red] failed to list queues via rabbitmqctl")
+		raise typer.Exit(1)
+
+	queues: list[Dict[str, str]] = []
+	for line in output.splitlines():
+		line = line.strip()
+		if not line or line.startswith("Listing"):
+			continue
+		parts = line.split()
+		if len(parts) < 4:
+			continue
+		queues.append(
+			{
+				"queue": parts[0],
+				"ready": parts[1],
+				"unacked": parts[2],
+				"consumers": parts[3],
+			}
+		)
+	queues.sort(key=lambda q: q["queue"])  # mimic original sort
+	return queues
+
+
+def color_for_ready(queue: str, ready: int, thresholds: Dict[str, Threshold]) -> str:
+	th = thresholds.get(queue)
+	if not th:
+		return "white"
+	if ready >= th.crit:
+		return "bold red"
+	if ready >= th.warn:
+		return "bold yellow"
+	return "bold green"
+
+
+def render_table(queues: list[Dict[str, str]], thresholds: Dict[str, Threshold]) -> None:
+	table = Table(
+		title="RabbitMQ Queues",
+		box=box.ROUNDED,
+		border_style="blue",
+		show_lines=False,
+		header_style="bold cyan",
+		expand=True,
+	)
+	table.add_column("Queue", overflow="fold")
+	table.add_column("Ready", justify="right")
+	table.add_column("Unacked", justify="right")
+	table.add_column("Consumers", justify="right")
+
+	for q in queues:
+		queue = q["queue"]
+		ready = int(q["ready"])
+		style = color_for_ready(queue, ready, thresholds)
+		ready_text = Text(q["ready"], style=style)
+		unacked_text = Text(q["unacked"], style="white")
+		# Consumers and expected handling: display as current/expected when expected is set
+		th = thresholds.get(queue)
+		expected = th.consumers if th else None
+		try:
+			consumers_val = int(q["consumers"]) if q["consumers"] != "-" else None
+		except ValueError:
+			consumers_val = None
+		consumers_style = "white"
+		if expected is not None and consumers_val is not None:
+			if consumers_val == expected:
+				consumers_style = "bold green"
+			else:
+				consumers_style = "bold red"
+		# Build display string
+		if expected is not None:
+			current_display = q["consumers"]
+			consumers_display = f"{current_display}/{expected}"
+		else:
+			consumers_display = q["consumers"]
+		consumers_text = Text(consumers_display, style=consumers_style)
+		table.add_row(queue, ready_text, unacked_text, consumers_text)
+
+	console.print(table)
+
+
+@app.callback(invoke_without_command=True)
+def _root(
+	ctx: typer.Context,
+	profile: Optional[str] = typer.Option(
+		None,
+		"--profile",
+		"-p",
+		help="Highlight profile name from config (~/.config/rbmqueues/config.yaml)",
+	),
+	thresholds: Optional[Path] = typer.Option(
+		None,
+		"--thresholds",
+		"-t",
+		help="Path to a thresholds YAML file (legacy/manual mode)",
+	),
+):
+	# If a subcommand is invoked (config, set, etc.), do nothing here.
+	if ctx.invoked_subcommand is not None:
+		return
+	# Default behavior: show queues, optionally highlighted by profile or thresholds
+	if profile:
+		th_map = thresholds_from_profile(profile)
+	elif thresholds:
+		th_map = load_thresholds(thresholds)
+	else:
+		th_map = {}
+	pod = detect_rabbitmq_pod()
+	if not pod:
+		console.print("[red]Error:[/red] No RabbitMQ pod found.")
+		raise typer.Exit(2)
+	queues = list_queues(pod)
+	render_table(queues, th_map)
+
+
+if __name__ == "__main__":  # pragma: no cover
+	try:
+		app()
+	except KeyboardInterrupt:
+		console.print("[yellow]Interrupted[/yellow]")
+		raise SystemExit(130)

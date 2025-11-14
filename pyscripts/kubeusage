@@ -1,0 +1,375 @@
+#!/usr/bin/env -S uv run --script
+
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["rich", "typer"]
+# ///
+
+import json
+import subprocess
+from collections import defaultdict
+from typing import List
+
+import typer
+from rich import box
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+console = Console()
+
+
+def run_kubectl(cmd):
+    """Run kubectl command and return JSON output"""
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, check=True
+        )
+        return json.loads(result.stdout)
+    except subprocess.CalledProcessError as e:
+        console.print(f"[red]Error running kubectl: {e}")
+        return None
+    except json.JSONDecodeError as e:
+        console.print(f"[red]Error parsing JSON: {e}")
+        return None
+
+
+def get_resource_value(resource_str):
+    """Convert kubernetes resource string to numeric value"""
+    if not resource_str or resource_str == "<unknown>":
+        return 0
+
+    # Handle CPU (millicores)
+    if resource_str.endswith("m"):
+        try:
+            return float(resource_str[:-1]) / 1000
+        except ValueError:
+            return 0
+    elif resource_str.endswith("n"):
+        try:
+            return float(resource_str[:-1]) / 1000000000
+        except ValueError:
+            return 0
+
+    # Handle Memory (bytes)
+    units = {"Ki": 1024, "Mi": 1024**2, "Gi": 1024**3, "Ti": 1024**4}
+    for unit, multiplier in units.items():
+        if resource_str.endswith(unit):
+            try:
+                return float(resource_str[:-2]) * multiplier
+            except ValueError:
+                return 0
+
+    # Handle plain numbers (assume cores for CPU, bytes for memory)
+    try:
+        return float(resource_str)
+    except ValueError:
+        return 0
+
+
+def format_cpu(cpu_cores):
+    """Format CPU value for display"""
+    if cpu_cores == 0:
+        return "N/A"
+    elif cpu_cores >= 1:
+        return f"{cpu_cores:.2f}"
+    else:
+        return f"{int(cpu_cores * 1000)}m"
+
+
+def format_memory(memory_bytes):
+    """Format memory value for display"""
+    if memory_bytes == 0:
+        return "N/A"
+    elif memory_bytes >= 1024**3:  # GB
+        return f"{memory_bytes / 1024**3:.1f}Gi"
+    elif memory_bytes >= 1024**2:  # MB
+        return f"{memory_bytes / 1024**2:.0f}Mi"
+    elif memory_bytes >= 1024:  # KB
+        return f"{memory_bytes / 1024:.0f}Ki"
+    else:
+        return f"{memory_bytes:.0f}B"
+
+
+def get_usage_color(percentage):
+    """Get color based on usage percentage"""
+    if percentage >= 90:
+        return "red"
+    elif percentage >= 60:
+        return "orange3"
+    else:
+        return "green"
+
+
+def get_memory_color(memory_gb):
+    """Get color based on memory in GB"""
+    if memory_gb > 2:
+        return "red"
+    elif memory_gb >= 1:
+        return "orange3"
+    else:
+        return "white"
+
+
+def get_node_metrics():
+    """Get node metrics from kubectl top nodes"""
+    return run_kubectl("kubectl top nodes --no-headers=true")
+
+
+def get_pod_metrics():
+    """Get pod metrics from kubectl top pods"""
+    return run_kubectl("kubectl top pods --all-namespaces --no-headers=true")
+
+
+def get_nodes_info():
+    """Get node information including capacity"""
+    return run_kubectl("kubectl get nodes -o json")
+
+
+def get_pods_info():
+    """Get pod information including node assignment"""
+    return run_kubectl("kubectl get pods --all-namespaces -o json")
+
+
+app = typer.Typer(
+    help="Display Kubernetes node and pod resource usage",
+    epilog="""
+Examples:
+  kubeusage                                    # Show all namespaces
+  kubeusage -n default                         # Show only default namespace
+  kubeusage --namespace kube-system            # Show only kube-system namespace  
+  kubeusage -n default -n kube-system          # Show multiple namespaces
+  kubeusage -d nginx -d redis                  # Show only pods from nginx and redis deployments
+  kubeusage -n default -d nginx                # Combine namespace and deployment filters
+        """,
+)
+
+
+@app.command()
+def main(
+    namespace: List[str] = typer.Option(
+        [],
+        "-n",
+        "--namespace",
+        help="Filter by namespace(s). Can be specified multiple times.",
+    ),
+    deployment: List[str] = typer.Option(
+        [],
+        "-d",
+        "--deployment",
+        help="Filter by deployment(s). Can be specified multiple times.",
+    ),
+):
+    """Display Kubernetes node and pod resource usage with optional filtering."""
+
+    # Parse filters
+    namespace_filter = set(namespace) if namespace else None
+    deployment_filter = set(deployment) if deployment else None
+
+    # Build filter description
+    filter_parts = []
+    if namespace_filter:
+        filter_parts.append(f"namespace(s): {', '.join(sorted(namespace_filter))}")
+    if deployment_filter:
+        filter_parts.append(f"deployment(s): {', '.join(sorted(deployment_filter))}")
+
+    if filter_parts:
+        console.print(
+            f"\n[cyan]Fetching Kubernetes resource usage for {' and '.join(filter_parts)}[/cyan]"
+        )
+    else:
+        console.print(
+            "\n[cyan]Fetching Kubernetes resource usage for all namespaces...[/cyan]"
+        )
+
+    # Get all required data
+    nodes_info = get_nodes_info()
+    pods_info = get_pods_info()
+
+    # Get metrics using kubectl top
+    try:
+        node_metrics_raw = (
+            subprocess.run(
+                "kubectl top nodes --no-headers",
+                shell=True,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            .stdout.strip()
+            .split("\n")
+        )
+
+        pod_metrics_raw = (
+            subprocess.run(
+                "kubectl top pods --all-namespaces --no-headers",
+                shell=True,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            .stdout.strip()
+            .split("\n")
+        )
+    except subprocess.CalledProcessError as e:
+        console.print(f"[red]Error getting metrics: {e}")
+        return
+
+    if not nodes_info or not pods_info:
+        console.print("[red]Failed to get node or pod information")
+        return
+
+    # Process node metrics
+    node_metrics = {}
+    for line in node_metrics_raw:
+        if line.strip():
+            parts = line.split()
+            if len(parts) >= 5:
+                name = parts[0]
+                cpu_usage = parts[1]
+                cpu_percent = int(parts[2].rstrip("%"))
+                memory_usage = parts[3]
+                memory_percent = int(parts[4].rstrip("%"))
+                node_metrics[name] = {
+                    "cpu_usage": cpu_usage,
+                    "cpu_percent": cpu_percent,
+                    "memory_usage": memory_usage,
+                    "memory_percent": memory_percent,
+                }
+
+    # Process pod metrics
+    pod_metrics = {}
+    for line in pod_metrics_raw:
+        if line.strip():
+            parts = line.split()
+            if len(parts) >= 4:
+                namespace = parts[0]
+                name = parts[1]
+                cpu = parts[2] if parts[2] != "<unknown>" else "0m"
+                memory = parts[3] if parts[3] != "<unknown>" else "0Mi"
+
+                # Apply namespace filter
+                if namespace_filter is None or namespace in namespace_filter:
+                    pod_metrics[f"{namespace}/{name}"] = {"cpu": cpu, "memory": memory}
+
+    # Create mapping of pods to nodes
+    pods_by_node = defaultdict(lambda: defaultdict(list))
+
+    for item in pods_info.get("items", []):
+        pod_name = item["metadata"]["name"]
+        namespace = item["metadata"]["namespace"]
+        node_name = item["spec"].get("nodeName", "Unknown")
+
+        # Get deployment name from owner references
+        deployment_name = None
+        owner_refs = item["metadata"].get("ownerReferences", [])
+        for owner in owner_refs:
+            if owner.get("kind") == "ReplicaSet":
+                # Get ReplicaSet name and derive deployment name (remove hash suffix)
+                rs_name = owner.get("name", "")
+                # Deployment name is typically the ReplicaSet name without the hash suffix
+                parts = rs_name.rsplit("-", 1)
+                if len(parts) > 1:
+                    deployment_name = parts[0]
+                break
+
+        # Apply namespace filter
+        namespace_matches = namespace_filter is None or namespace in namespace_filter
+        # Apply deployment filter
+        deployment_matches = deployment_filter is None or (
+            deployment_name and deployment_name in deployment_filter
+        )
+
+        if namespace_matches and deployment_matches:
+            pod_key = f"{namespace}/{pod_name}"
+            if pod_key in pod_metrics:
+                metrics = pod_metrics[pod_key]
+                cpu_cores = get_resource_value(metrics["cpu"])
+                memory_bytes = get_resource_value(metrics["memory"])
+                memory_gb = memory_bytes / (1024**3)
+
+                pods_by_node[node_name][namespace].append(
+                    {
+                        "name": pod_name,
+                        "cpu": cpu_cores,
+                        "memory_bytes": memory_bytes,
+                        "memory_gb": memory_gb,
+                        "cpu_str": metrics["cpu"],
+                        "memory_str": metrics["memory"],
+                        "deployment": deployment_name,
+                    }
+                )
+
+    # Create the table
+    table = Table(
+        title="[cyan bold]Kubernetes Node and Pod Resource Usage[/cyan bold]",
+        box=box.ROUNDED,
+        border_style="blue",
+        header_style="cyan bold",
+        show_header=True,
+        expand=True,
+        row_styles=["", ""],
+        show_lines=True,
+    )
+
+    table.add_column("Node Usage", style="white", width=40)
+    table.add_column("Pods by Namespace", style="white", min_width=60)
+
+    # Add rows for each node
+    for node_name in sorted(node_metrics.keys()):
+        metrics = node_metrics[node_name]
+
+        # Format node usage with colors
+        cpu_color = get_usage_color(metrics["cpu_percent"])
+        memory_color = get_usage_color(metrics["memory_percent"])
+
+        node_usage = Text()
+        node_usage.append(f"{node_name}\n", style="bold white")
+        node_usage.append("CPU: ", style="white")
+        node_usage.append(
+            f"{metrics['cpu_usage']} ({metrics['cpu_percent']}%)", style=cpu_color
+        )
+        node_usage.append("\nMemory: ", style="white")
+        node_usage.append(
+            f"{metrics['memory_usage']} ({metrics['memory_percent']}%)",
+            style=memory_color,
+        )
+
+        # Format pods by namespace
+        pods_text = Text()
+
+        if node_name in pods_by_node:
+            for namespace in sorted(pods_by_node[node_name].keys()):
+                pods_text.append(f"{namespace}\n", style="cyan bold")
+
+                for pod in sorted(
+                    pods_by_node[node_name][namespace], key=lambda x: x["name"]
+                ):
+                    # Determine color based on both CPU and memory usage
+                    memory_color = get_memory_color(pod["memory_gb"])
+                    cpu_usage_percent = (pod["cpu"] / 4.0) * 100  # Assuming 4 core baseline
+                    cpu_color = get_usage_color(min(cpu_usage_percent, 100))
+                    
+                    # Use the "worse" color (red > orange > green/white)
+                    color_priority = {"red": 3, "orange3": 2, "green": 1, "white": 1}
+                    pod_color = memory_color if color_priority.get(memory_color, 1) >= color_priority.get(cpu_color, 1) else cpu_color
+                    
+                    # Apply color to entire pod line
+                    pod_line = f"  └─ {pod['name']} ({pod['cpu_str']}, {pod['memory_str']})\n"
+                    pods_text.append(pod_line, style=pod_color)
+
+                pods_text.append("\n")
+        else:
+            pods_text.append("No pods scheduled", style="dim")
+
+        table.add_row(node_usage, pods_text)
+
+    # Display the table
+    console.print("\n")
+    console.print(table)
+    console.print("\n")
+
+
+if __name__ == "__main__":
+    app()
