@@ -1,12 +1,11 @@
 # -------------------------
 # GLOBAL SETTINGS
 # -------------------------
-add_newline = true
+add_newline = false
 
 # Line 1: left (git, venv, cwd) + right (k8s, battery, time)
 # Line 2: prompt symbol only
-format = """
-($git_branch( $git_commit)( $git_status))( ≻$python)( ≻$directory)$fill(≺$kubernetes )(≺$battery )(≺$time)
+format = """($git_branch( $git_commit)( $git_status))( ≻$python)( ≻$directory)$fill(≺$kubernetes )(≺$battery )(≺$time)
 $character
 """
 
@@ -39,7 +38,7 @@ format = "[@$hash]($style)"
 commit_hash_length = 7
 only_detached = false
 tag_disabled = true
-style = "fg:#585858 dimmed"
+style = "fg:#e8e8e8 dimmed"
 
 [python]
 format = " [$symbol$virtualenv](style)"

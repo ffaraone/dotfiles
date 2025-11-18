@@ -1,0 +1,183 @@
+#!/usr/bin/env -S uv run --script
+
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["typer"]
+# ///
+
+import json
+import subprocess
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import typer
+
+app = typer.Typer(add_completion=False)
+
+# regex to strip ANSI / terminal escape sequences
+ANSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+
+
+def run_kubectl(cmd: List[str]) -> str:
+	try:
+		cp = subprocess.run(["kubectl"] + cmd, check=True, capture_output=True, text=True)
+		return cp.stdout
+	except subprocess.CalledProcessError as e:
+		typer.echo(f"Error running kubectl {' '.join(cmd)}:\n{e.stderr or e.stdout}")
+		raise typer.Exit(code=2)
+
+
+def find_workloads(name: str) -> List[Dict]:
+	# search common workload kinds in current namespace
+	kinds = ["deploy", "rs", "sts", "ds", "job", "rc"]
+	out = run_kubectl(["get", ",".join(kinds), "-o", "json"])
+	data = json.loads(out)
+	matches = []
+	for item in data.get("items", []):
+		nm = item.get("metadata", {}).get("name", "")
+		if name in nm:
+			matches.append(item)
+	return matches
+
+
+def selector_from_workload(item: Dict) -> Optional[str]:
+	spec = item.get("spec", {})
+	selector = spec.get("selector")
+	if not selector:
+		return None
+	# selector can be a dict with matchLabels or an object containing matchLabels
+	labels: Dict[str, str] = {}
+	if isinstance(selector, dict) and "matchLabels" in selector:
+		labels = selector.get("matchLabels") or {}
+	elif isinstance(selector, dict) and any(k.startswith("matchLabels") for k in selector.keys()):
+		labels = selector.get("matchLabels") or {}
+	elif "matchLabels" in spec:
+		labels = spec.get("matchLabels") or {}
+
+	if not labels:
+		return None
+	parts = [f"{k}={v}" for k, v in labels.items()]
+	return ",".join(parts)
+
+
+def pods_for_workload(item: Dict) -> List[Dict]:
+	name = item.get("metadata", {}).get("name")
+	selector = selector_from_workload(item)
+	pods = []
+	if selector:
+		out = run_kubectl(["get", "pods", "-l", selector, "-o", "json"])
+		pods = json.loads(out).get("items", [])
+	else:
+		# fallback: find pods where ownerReferences includes this workload's name
+		out = run_kubectl(["get", "pods", "-o", "json"])
+		for p in json.loads(out).get("items", []):
+			for owner in p.get("metadata", {}).get("ownerReferences", []):
+				if owner.get("name") == name:
+					pods.append(p)
+					break
+	return pods
+
+
+def filename_for(base: str, output_dir: Optional[Path] = None) -> Path:
+	today = datetime.now().strftime("%Y%m%d")
+	if output_dir is None:
+		output_dir = Path(".")
+	else:
+		output_dir = Path(output_dir)
+	output_dir.mkdir(parents=True, exist_ok=True)
+	base_name = f"{base}_{today}.log"
+	p = output_dir / base_name
+	if not p.exists():
+		return p
+	counter = 1
+	while True:
+		p2 = output_dir / f"{base}_{today}_{counter}.log"
+		if not p2.exists():
+			return p2
+		counter += 1
+
+
+def write_logs(path: Path, pods: List[Dict], include_timestamps: bool, strip_ansi: bool) -> None:
+	with path.open("w", encoding="utf-8") as fh:
+		for p in pods:
+			pod_name = p.get("metadata", {}).get("name")
+			containers = []
+			spec = p.get("spec", {})
+			for c in spec.get("containers", []):
+				containers.append(c.get("name"))
+			for c in spec.get("initContainers", []) if spec.get("initContainers") else []:
+				containers.append(c.get("name"))
+			if not containers:
+				containers = [None]
+			for container in containers:
+				header = f"=== POD: {pod_name}"
+				if container:
+					header += f" CONTAINER: {container}"
+				header += " ===\n"
+				fh.write(header)
+				cmd = ["logs", pod_name]
+				if container:
+					cmd += ["-c", container]
+				if include_timestamps:
+					cmd += ["--timestamps"]
+				try:
+					out = run_kubectl(cmd)
+				except typer.Exit:
+					fh.write(f"(error fetching logs for {pod_name}{':' + container if container else ''})\n")
+					continue
+				if strip_ansi:
+					out = ANSI_RE.sub("", out)
+				fh.write(out)
+				fh.write("\n")
+
+
+@app.command()
+def main(
+	name: str = typer.Argument(..., help="Full or partial name of a deployment/replicaset/statefulset"),
+	no_timestamps: bool = typer.Option(False, "--no-timestamps", "-n", help="Do not include timestamps"),
+	output_dir: Optional[Path] = typer.Option(
+		None, "--output-dir", "-d", help="Directory to save the log file",
+	),
+	strip_ansi: bool = typer.Option(False, "--strip-ansi", "-s", help="Strip ANSI color/terminal escape sequences from output"),
+) -> None:
+	matches = find_workloads(name)
+	if not matches:
+		typer.echo(f"No workloads matching '{name}' found in current namespace.")
+		raise typer.Exit(code=1)
+
+	# If multiple matches, prefer a single non-ReplicaSet workload (e.g. Deployment)
+	if len(matches) > 1:
+		# If an exact-name match exists, prefer it
+		exact = [m for m in matches if m.get("metadata", {}).get("name") == name]
+		if len(exact) == 1:
+			matches = exact
+		else:
+			non_rs = [m for m in matches if m.get("kind") != "ReplicaSet"]
+			if len(non_rs) == 1:
+				matches = non_rs
+
+	if len(matches) > 1:
+		typer.echo("Ambiguous name, multiple workloads match. Please disambiguate by using a more specific name or one of the following:")
+		for m in matches:
+			nm = m.get("metadata", {}).get("name")
+			k = m.get("kind")
+			typer.echo(f"- {k}: {nm}")
+		raise typer.Exit(code=2)
+
+	item = matches[0]
+	workload_name = item.get("metadata", {}).get("name")
+	pods = pods_for_workload(item)
+	if not pods:
+		typer.echo(f"No pods found for workload '{workload_name}'.")
+		raise typer.Exit(code=1)
+
+	outpath = filename_for(workload_name, output_dir=output_dir)
+	write_logs(outpath, pods, include_timestamps=not no_timestamps, strip_ansi=strip_ansi)
+	typer.echo(f"Wrote logs to {outpath}")
+
+
+if __name__ == "__main__":
+	app()
+

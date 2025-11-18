@@ -1,0 +1,192 @@
+#!/usr/bin/env -S uv run --script
+
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["rich", "typer"]
+# ///
+
+from __future__ import annotations
+
+import json
+import subprocess
+from datetime import datetime, timezone
+from typing import Optional
+
+import typer
+from rich import box
+from rich.console import Console
+from rich.table import Table
+
+app = typer.Typer(help="Show pods that restarted with last restart reason and optional logs.")
+console = Console()
+
+
+def _run_cmd(cmd: list[str]) -> str:
+	try:
+		out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+		return out.decode()
+	except subprocess.CalledProcessError:
+		return ""
+
+
+def _parse_time(timestr: Optional[str]) -> Optional[datetime]:
+	if not timestr:
+		return None
+	# Kubernetes uses RFC3339 with Z; replace Z with +00:00 for fromisoformat
+	try:
+		if timestr.endswith("Z"):
+			timestr = timestr.replace("Z", "+00:00")
+		return datetime.fromisoformat(timestr)
+	except Exception:
+		return None
+
+
+def _format_timedelta(dt: datetime) -> str:
+	now = datetime.now(timezone.utc)
+	diff = now - dt
+	seconds = int(diff.total_seconds())
+	if seconds < 60:
+		return f"{seconds}s ago"
+	minutes = seconds // 60
+	if minutes < 60:
+		return f"{minutes}m ago"
+	hours = minutes // 60
+	if hours < 24:
+		rem = minutes % 60
+		return f"{hours}h {rem}m ago"
+	days = hours // 24
+	return f"{days}d {hours%24}h ago"
+
+
+@app.command()
+def main(
+	lines: int = typer.Option(5, "--lines", "-n", help="Lines of previous logs to show when process exited."),
+	namespace: Optional[str] = typer.Option(None, "--namespace", "-N", help="Kubernetes namespace (default: all namespaces)."),
+):
+	"""List pods that restarted at least once showing Pod, Last Restart and Reason.
+
+	If the last restart was due to a process exit (non-zero exit code or reason 'Error'),
+	include the last `--lines` lines from the previous container logs.
+	"""
+
+	# Gather pods JSON
+	cmd = ["kubectl", "get", "pods", "-o", "json"]
+	if namespace:
+		cmd.extend(["-n", namespace])
+
+	raw = _run_cmd(cmd)
+	if not raw:
+		console.print("No pods found or kubectl failed.", style="red")
+		raise typer.Exit(1)
+
+	data = json.loads(raw)
+
+	table = Table(box=box.ROUNDED, border_style="blue", header_style="cyan", show_lines=True)
+	table.add_column("Pod", style="bold")
+	table.add_column("Last Restart", no_wrap=True)
+	table.add_column("Reason")
+
+	items = data.get("items", [])
+	for pod in items:
+		meta = pod.get("metadata", {})
+		status = pod.get("status", {})
+		pod_name = meta.get("name")
+		ns = meta.get("namespace", "default")
+
+		container_statuses = status.get("containerStatuses") or []
+		# find containers with restartCount>0
+		restarted_containers = [cs for cs in container_statuses if (cs.get("restartCount") or 0) > 0]
+		if not restarted_containers:
+			continue
+
+		# Determine the most recent termination time across containers
+		chosen_time: Optional[datetime] = None
+		chosen_reason = ""
+		chosen_container_name: Optional[str] = None
+		chosen_terminated: Optional[dict] = None
+
+		for cs in restarted_containers:
+			# lastState holds the previous terminated state for that container
+			last_state = cs.get("lastState", {})
+			state = cs.get("state", {})
+
+			# prefer lastState.terminated.finishedAt, fallback to state.terminated.finishedAt
+			cand = None
+			if last_state and last_state.get("terminated"):
+				cand = last_state["terminated"]
+			elif state and state.get("terminated"):
+				cand = state["terminated"]
+
+			if not cand:
+				continue
+
+			finished_at = _parse_time(cand.get("finishedAt"))
+			if not finished_at:
+				continue
+
+			if chosen_time is None or finished_at > chosen_time:
+				chosen_time = finished_at
+				chosen_reason = cand.get("reason") or cand.get("message") or ""
+				chosen_container_name = cs.get("name")
+				chosen_terminated = cand
+
+		if chosen_time is None:
+			# if we couldn't parse finishedAt, still list the pod with a note
+			last_restart = "unknown"
+		else:
+			last_restart = _format_timedelta(chosen_time)
+
+		reason_text = chosen_reason or "Unk"
+
+		# Decide if process exited: exitCode present and non-zero OR reason contains 'Error' or 'Exit'
+		include_logs = False
+		if chosen_terminated:
+			exit_code = chosen_terminated.get("exitCode")
+			if exit_code is not None and exit_code != 0:
+				include_logs = True
+			rt = (chosen_terminated.get("reason") or "").lower()
+			if "error" in rt or "exit" in rt:
+				include_logs = True
+
+		# Fetch previous logs when required
+		logs_text = ""
+		if include_logs and chosen_container_name:
+			log_cmd = [
+				"kubectl",
+				"logs",
+				pod_name,
+				"-c",
+				chosen_container_name,
+				"--previous",
+				"--tail",
+				str(lines),
+			]
+			if namespace:
+				log_cmd.extend(["-n", namespace])
+			else:
+				# include namespace if not default to be explicit
+				log_cmd.extend(["-n", ns])
+
+			logs_text = _run_cmd(log_cmd).strip()
+			if logs_text:
+				reason_text = f"{reason_text}\n\nLast logs (last {lines} lines):\n{logs_text}"
+
+		# color pod name based on how recent
+		pod_display = pod_name
+		if chosen_time:
+			now = datetime.now(timezone.utc)
+			diff = now - chosen_time
+			seconds = diff.total_seconds()
+			if seconds < 3600:
+				pod_display = f"[red]{pod_name}[/red]"
+			elif seconds < 3600 * 24:
+				pod_display = f"[orange1]{pod_name}[/orange1]"
+
+		table.add_row(pod_display, last_restart, reason_text)
+
+	console.print(table)
+
+
+if __name__ == "__main__":
+	app()
+
