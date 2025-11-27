@@ -1,0 +1,149 @@
+#!/usr/bin/env -S uv run --script
+
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["rich", "typer"]
+# ///
+"""Generate a single rounded blue table of sibling scripts.
+
+This script scans the directory where it lives for scripts (including itself),
+extracts their documentation (module docstring or leading top comment block)
+and prints a single rounded table using Rich. Docstrings are rendered as
+Markdown inside the table. If a script has no docstring, a single "-" is
+shown in the Description column.
+
+Only a single table output is produced (no JSON/MD/other formats).
+"""
+
+from __future__ import annotations
+
+import ast
+import os
+import re
+from pathlib import Path
+from typing import List
+
+
+def is_script_file(p: Path) -> bool:
+	if not p.is_file():
+		return False
+	if p.name.startswith("."):
+		return False
+	try:
+		p.stat()
+	except OSError:
+		return False
+	# executable bit or shebang
+	if os.access(p, os.X_OK):
+		return True
+	try:
+		with p.open("rb") as f:
+			first = f.readline()
+		if first.startswith(b"#!"):
+			return True
+	except OSError:
+		return False
+	return False
+
+
+def extract_doc(path: Path) -> str:
+	try:
+		text = path.read_text(encoding="utf8")
+	except Exception:
+		return ""
+
+	# Try Python module docstring using ast
+	try:
+		module = ast.parse(text)
+		doc = ast.get_docstring(module)
+		if doc:
+			return doc.strip()
+	except Exception:
+		pass
+
+	# Fallback: contiguous leading comment block
+	lines = text.splitlines()
+	comment_lines: List[str] = []
+	for line in lines:
+		stripped = line.lstrip()
+		if stripped.startswith("#"):
+			# remove leading '#' and one optional space
+			comment_lines.append(stripped[1:].lstrip())
+		elif stripped == "":
+			if comment_lines:
+				break
+			else:
+				continue
+		else:
+			break
+	if comment_lines:
+		return "\n".join(comment_lines).strip()
+
+	# Try to capture a custom block between "# /// script" markers
+	m = re.search(r"#\s*///\s*script(.*?)#\s*///", text, re.S)
+	if m:
+		return m.group(1).strip()
+
+	return ""
+
+
+def find_scripts(folder: Path) -> List[Path]:
+	# include all detected script files (including this file)
+	candidates = [p for p in folder.iterdir() if is_script_file(p)]
+	return sorted(candidates, key=lambda p: p.name.lower())
+
+
+def build_catalog(folder: Path) -> List[dict]:
+	scripts = find_scripts(folder)
+	catalog = []
+	for p in scripts:
+		doc = extract_doc(p)
+		catalog.append({"name": p.name, "path": str(p.resolve()), "doc": doc})
+	return catalog
+
+
+def print_table(catalog: List[dict]) -> int:
+	# Use rich to render a rounded blue table. Render Markdown in the
+	# Description cell when docstring is present; otherwise show '-'.
+	try:
+		from rich.console import Console
+		from rich.table import Table
+		from rich.markdown import Markdown
+		from rich import box
+	except Exception:
+		# If rich is not available, print a simple fallback ASCII table.
+		name_w = max((len(item["name"]) for item in catalog), default=6)
+		print(f"{'Name':<{name_w}}  Description")
+		print("-" * (name_w + 2 + 60))
+		for item in catalog:
+			desc = item["doc"].splitlines()[0] if item["doc"] else "-"
+			print(f"{item['name']:<{name_w}}  {desc}")
+		return 0
+
+	console = Console()
+	table = Table(box=box.ROUNDED, show_header=True, header_style="bold white", border_style="blue")
+	table.add_column("Name", style="bold green", no_wrap=True)
+	table.add_column("Description", style="white")
+
+	for item in catalog:
+		if item["doc"]:
+			md = Markdown(item["doc"])  # render as markdown inside table cell
+			table.add_row(item["name"], md)
+		else:
+			table.add_row(item["name"], "-")
+
+	console.print(table)
+	return 0
+
+
+def main() -> int:
+	folder = Path(__file__).resolve().parent
+	catalog = build_catalog(folder)
+	return print_table(catalog)
+
+
+
+if __name__ == "__main__":
+	raise SystemExit(main())
+
+

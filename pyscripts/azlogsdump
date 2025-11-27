@@ -1,0 +1,409 @@
+#!/usr/bin/env -S uv run --script
+
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["rich", "typer"]
+# ///
+
+"""Dump logs from Azure Log Analytics Workspace to files."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import os
+import re
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import typer
+from rich.console import Console
+from rich.table import Table
+from rich import box
+
+console = Console()
+app = typer.Typer(help="Dump ContainerLogV2 logs from Azure Log Analytics workspaces")
+
+
+# Config file location
+def _config_dir() -> Path:
+    return Path.home() / '.config' / "azlogsdump"
+
+
+def _config_file() -> Path:
+    return _config_dir() / 'config.json'
+
+
+def load_config() -> dict:
+    p = _config_file()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    d = _config_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    _config_file().write_text(json.dumps(cfg, indent=2), encoding='utf-8')
+
+
+def parse_time_or_relative(value: str | None, default_delta: timedelta | None = None) -> datetime | None:
+    if value is None:
+        return None
+    value = value.strip()
+    # relative like 24h, 7d, 30m
+    m = re.match(r"^(?P<num>\d+)(?P<unit>[smhd])$", value)
+    if m:
+        n = int(m.group('num'))
+        unit = m.group('unit')
+        if unit == 's':
+            return datetime.now(timezone.utc) - timedelta(seconds=n)
+        if unit == 'm':
+            return datetime.now(timezone.utc) - timedelta(minutes=n)
+        if unit == 'h':
+            return datetime.now(timezone.utc) - timedelta(hours=n)
+        if unit == 'd':
+            return datetime.now(timezone.utc) - timedelta(days=n)
+    # try ISO parse
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        raise typer.BadParameter(f"Could not parse time '{value}'. Use ISO or relative like '24h'.")
+
+
+@dataclass
+class Row:
+    TimeGenerated: str
+    ContainerName: str
+    LogMessage: str
+    PodName: str | None = None
+
+
+def build_query(container_prefix: str | None, start: datetime, end: datetime, max_rows: int = 200_000) -> str:
+    query = (
+        "ContainerLogV2 "
+        f"| where ContainerName startswith '{container_prefix}' "
+        f"and TimeGenerated between (datetime({start.isoformat()}) .. datetime({end.isoformat()})) "
+        f"| project TimeGenerated, ContainerName, PodName, LogMessage | take {max_rows}"
+    )
+    return query
+
+
+def query_with_az(workspace: str, query: str, start: datetime, end: datetime) -> dict:
+    timespan = f"{start.isoformat()}/{end.isoformat()}"
+    cmd = [
+        'az', 'monitor', 'log-analytics', 'query',
+        '-w', workspace,
+        '--analytics-query', query,
+        '--timespan', timespan,
+        '--output', 'json'
+    ]
+    print(cmd)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr or ''
+        raise typer.Exit(f"az CLI query failed: {stderr.strip()}")
+    try:
+        return json.loads(proc.stdout)
+    except Exception as exc:
+        raise typer.Exit(f"Failed to parse az CLI JSON output: {exc}")
+
+
+# Config sub-commands (grouped under `config`)
+config_app = typer.Typer(help="Manage saved workspace ids (prod/dev/test/stage)")
+
+
+def _is_uuid(v: str) -> bool:
+    return bool(re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', v))
+
+
+def _resolve_workspace(value: str) -> str:
+    """If value looks like a uuid, return it; otherwise try to resolve a workspace name to its customerId via az CLI."""
+    if _is_uuid(value):
+        return value
+    # try to call az to find workspace by name
+    name = value
+    cmd = [
+        'az', 'monitor', 'log-analytics', 'workspace', 'list',
+        '--query', f"[?name=='{name}']",
+        '--output', 'json'
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr or ''
+        raise typer.Exit(f"Failed to resolve workspace '{value}' via az CLI: {stderr.strip()}")
+    try:
+        results = json.loads(proc.stdout)
+    except Exception as exc:
+        raise typer.Exit(f"Failed to parse az CLI output when resolving workspace '{value}': {exc}")
+    if not results:
+        raise typer.Exit(f"No workspace found with name '{value}'")
+    if len(results) > 1:
+        # try to pick exact match on name (should already match), otherwise prefer first
+        exact = [r for r in results if r.get('name') == name]
+        picked = exact[0] if exact else results[0]
+    else:
+        picked = results[0]
+    # workspace object contains customerId which is the workspace id
+    wid = picked.get('customerId') or picked.get('workspaceId') or picked.get('id')
+    if not wid:
+        raise typer.Exit(f"Could not extract workspace id for '{value}' from az CLI result")
+    return wid
+
+
+@config_app.command("set")
+def config_set(
+    prod: str | None = typer.Option(None, '--prod', help='Set prod workspace id or name'),
+    dev: str | None = typer.Option(None, '--dev', help='Set dev workspace id or name'),
+    test: str | None = typer.Option(None, '--test', help='Set test workspace id or name'),
+    stage: str | None = typer.Option(None, '--stage', help='Set stage workspace id or name'),
+):
+    """Set saved workspace ids in ~/.config/azlogsdump/config.json"""
+    cfg = load_config()
+    changed = False
+    if prod:
+        cfg['prod'] = _resolve_workspace(prod)
+        changed = True
+    if dev:
+        cfg['dev'] = _resolve_workspace(dev)
+        changed = True
+    if test:
+        cfg['test'] = _resolve_workspace(test)
+        changed = True
+    if stage:
+        cfg['stage'] = _resolve_workspace(stage)
+        changed = True
+
+    if changed:
+        save_config(cfg)
+        console.print("Configuration updated.")
+    else:
+        console.print("No changes made. Provide --prod/--dev/--test/--stage to set values.")
+
+
+@config_app.callback(invoke_without_command=True)
+def config_main(
+    prod: str | None = typer.Option(None, '--prod', help='Set prod workspace id or name'),
+    dev: str | None = typer.Option(None, '--dev', help='Set dev workspace id or name'),
+    test: str | None = typer.Option(None, '--test', help='Set test workspace id or name'),
+    stage: str | None = typer.Option(None, '--stage', help='Set stage workspace id or name'),
+    show: bool = typer.Option(False, '--show', '-s', help='Show current config'),
+):
+    """Compatibility entrypoint: `azlogsdump config [--prod ...]` behaves like `config set` or `config show`."""
+    # If a subcommand was invoked (set/show) Typer will not call this.
+    changed = False
+    cfg = load_config()
+    if prod:
+        cfg['prod'] = _resolve_workspace(prod)
+        changed = True
+    if dev:
+        cfg['dev'] = _resolve_workspace(dev)
+        changed = True
+    if test:
+        cfg['test'] = _resolve_workspace(test)
+        changed = True
+    if stage:
+        cfg['stage'] = _resolve_workspace(stage)
+        changed = True
+
+    if changed:
+        save_config(cfg)
+        console.print("Configuration updated.")
+
+
+@config_app.command("show")
+def config_show():
+    """Show saved workspace ids in a table with colored borders/headers"""
+    cfg = load_config()
+    if not cfg:
+        console.print("[yellow]No workspaces configured.[/yellow]")
+        return
+
+    table = Table(title="Saved Workspaces", box=box.ROUNDED, border_style="blue", header_style="bold cyan")
+    table.add_column("Environment", style="cyan", no_wrap=True)
+    table.add_column("Workspace Id / Name", style="white")
+
+    # Present in a consistent order
+    for env in ("prod", "stage", "dev", "test"):
+        wid = cfg.get(env)
+        if wid is None:
+            continue
+        table.add_row(env, str(wid))
+
+    # Any other keys
+    extras = [k for k in sorted(cfg.keys()) if k not in ("prod", "stage", "dev", "test")]
+    for k in extras:
+        table.add_row(k, str(cfg.get(k)))
+
+    console.print(table)
+
+
+# register the config sub-app
+app.add_typer(config_app, name="config")
+
+
+@app.callback(invoke_without_command=True)
+def main(
+    ctx: typer.Context,
+    container: str | None = typer.Argument(None, help='ContainerName startswith (positional)'),
+    start: str | None = typer.Option(None, help="Start time (ISO) or relative like '24h'). If omitted, defaults to 24h ago."),
+    end: str | None = typer.Option(None, help="End time (ISO). Defaults to now UTC."),
+    search: str | None = typer.Option(None, '--search', '-s', help='Search string to find in Message'),
+    context: int = typer.Option(50, help='Number of rows before/after matching row to include'),
+    dev: bool = typer.Option(False, help='Use dev workspace'),
+    test: bool = typer.Option(False, help='Use test workspace'),
+    stage: bool = typer.Option(False, help='Use stage workspace'),
+    workspace: str | None = typer.Option(None, help='Explicit workspace id (overrides config/mode)'),
+    out_dir: str = typer.Option('.', '-d', '--dir', help='Output directory for .log files (default current directory)'),
+    max_rows: int = typer.Option(200_000, help='Maximum rows to fetch from workspace'),
+):
+    """Dump logs for a container (positional) from ContainerLogV2.
+
+    Use `config` subcommand to set workspace ids, e.g.:
+      ./azlogsdump config --prod <workspace-id>
+
+    Example:
+      ./azlogsdump mycontainer --search error -d ./logs
+    """
+
+    # If a subcommand was invoked, do nothing here and let Typer handle it
+    if ctx.invoked_subcommand is not None:
+        return
+
+    # Choose workspace
+    if sum([1 if v else 0 for v in (dev, test, stage)]) > 1:
+        raise typer.Exit("--dev, --test and --stage are mutually exclusive")
+
+    if workspace:
+        ws = workspace
+    else:
+        cfg = load_config()
+
+        def cfg_get_or_fail(key: str, display: str):
+            v = cfg.get(key)
+            if not v:
+                raise typer.Exit(f"Workspace for {display} is not configured. Run: `{Path(__file__).name} config --{display} <workspace-id>`")
+            return v
+
+        if dev:
+            ws = cfg_get_or_fail('dev', 'dev')
+        elif test:
+            ws = cfg_get_or_fail('test', 'test')
+        elif stage:
+            ws = cfg_get_or_fail('stage', 'stage')
+        else:
+            ws = cfg_get_or_fail('prod', 'prod')
+
+    # Parse times
+    end_dt = parse_time_or_relative(end) or datetime.now(timezone.utc)
+    if start is None:
+        start_dt = end_dt - timedelta(hours=24)
+    else:
+        start_dt = parse_time_or_relative(start) or (end_dt - timedelta(hours=24))
+
+    if start_dt >= end_dt:
+        raise typer.Exit('start must be before end')
+
+    # Build KQL
+    query = build_query(container, start_dt, end_dt, max_rows=max_rows)
+
+    # Use az CLI to query logs
+    console.print(f"Querying workspace [bold]{ws}[/] with az CLI from [cyan]{start_dt.isoformat()}[/] to [cyan]{end_dt.isoformat()}[/]")
+    rows = [Row(
+        TimeGenerated=r.get("TimeGenerated", ""),
+        ContainerName=r.get("ContainerName", ""),
+        PodName=r.get("PodName", ""),
+        LogMessage=r.get("LogMessage", ""),
+    ) for r in query_with_az(ws, query, start_dt, end_dt)]
+    
+
+    if not rows:
+        console.print("No rows in timeframe")
+        raise typer.Exit(0)
+
+    # If search provided, compute indices to keep (context before/after)
+    indices_to_keep = set(range(len(rows)))
+    if search:
+        s = search.lower()
+        match_indices: list[int] = []
+        for i, r in enumerate(rows):
+            if s in (r.LogMessage or '').lower():
+                match_indices.append(i)
+        if not match_indices:
+            console.print(f"No matches for '{search}'")
+            raise typer.Exit(0)
+        indices_to_keep = set()
+        for mi in match_indices:
+            start_i = max(0, mi - context)
+            end_i = min(len(rows) - 1, mi + context)
+            indices_to_keep.update(range(start_i, end_i + 1))
+
+    selected_indices = sorted(indices_to_keep)
+    selected_rows = [rows[i] for i in selected_indices]
+
+    # Write files grouped by container name
+    os.makedirs(out_dir, exist_ok=True)
+    date_part = start_dt.strftime('%Y%m%d')
+
+    groups: dict[str, list[Row]] = {}
+    for r in selected_rows:
+        key = (r.ContainerName or 'allcontainers').strip() or 'allcontainers'
+        groups.setdefault(key, []).append(r)
+
+    written_files: list[str] = []
+    total_lines = 0
+    for container_name, rows_group in groups.items():
+        container_file = re.sub(r"[^A-Za-z0-9._-]", "_", container_name)
+        base_filename = f"{container_file}_{date_part}.log"
+        out_path = os.path.join(out_dir, base_filename)
+        if os.path.exists(out_path):
+            counter = 1
+            while True:
+                candidate = os.path.join(out_dir, f"{container_file}_{date_part}_{counter}.log")
+                if not os.path.exists(candidate):
+                    out_path = candidate
+                    break
+                counter += 1
+
+        with open(out_path, 'w', encoding='utf-8') as fh:
+            for r in rows_group:
+                ts = r.TimeGenerated
+                pod = (r.PodName or '').strip() or ''
+                msg = (r.LogMessage or '').replace('\n', ' ').replace('\r', ' ')
+                fh.write(f"{ts} [{pod}] {msg}\n")
+                total_lines += 1
+
+        written_files.append(out_path)
+
+    console.print(f"Wrote {total_lines} lines to {len(written_files)} files:")
+    for p in written_files:
+        console.print(f" - [green]{p}[/]")
+
+
+if __name__ == '__main__':
+    import sys
+
+    # If the user invoked `config` as the first argument, dispatch directly
+    # to the `config_app` after removing the `config` token so Typer/Click
+    # parses the subcommands/options correctly instead of treating it as
+    # the positional `container` argument on the main app.
+    if len(sys.argv) > 1 and sys.argv[1] == 'config':
+        # remove the 'config' token
+        sys.argv.pop(1)
+        try:
+            config_app()
+        except SystemExit:
+            raise
+    else:
+        app()
+    
+

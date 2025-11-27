@@ -1,0 +1,159 @@
+#!/usr/bin/env -S uv run --script
+
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["rich", "typer"]
+# ///
+
+"""Show the list of Azure subscriptions, highlight the active one and allow switching.
+
+This script calls the Azure CLI (`az`) to list subscriptions and to switch the
+active subscription. It displays a pretty table via `rich` and prompts the user
+to pick a subscription to activate.
+
+Usage examples:
+  - Interactive: run the script and choose an index
+  - Direct switch: `azss <subscription-id-or-name>`
+  - Skip confirm: `azss --yes <subscription-id-or-name>`
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from typing import List, Optional
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+app = typer.Typer(add_completion=False)
+console = Console()
+
+
+def az_cmd(*args: str) -> subprocess.CompletedProcess:
+    """Run an `az` CLI command and return CompletedProcess.
+
+    Raises typer.Exit on failure with a helpful message.
+    """
+    cmd = ["az", *args, "-o", "json"]
+    try:
+        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        return proc
+    except FileNotFoundError:
+        console.print("[red]Azure CLI (`az`) not found on PATH.[/red]")
+        raise typer.Exit(2)
+    except subprocess.CalledProcessError as e:
+        # Try to show stderr as friendly message
+        stderr = e.stderr.strip() if e.stderr else None
+        console.print(f"[red]`az {' '.join(args)}` failed.[/red]")
+        if stderr:
+            console.print(stderr)
+        raise typer.Exit(3)
+
+
+def list_subscriptions() -> List[dict]:
+    proc = az_cmd("account", "list")
+    try:
+        return json.loads(proc.stdout)
+    except Exception:
+        console.print("[red]Failed to parse subscriptions list.[/red]")
+        raise typer.Exit(4)
+
+
+def current_subscription() -> Optional[dict]:
+    proc = az_cmd("account", "show")
+    try:
+        return json.loads(proc.stdout)
+    except Exception:
+        return None
+
+
+def print_subscriptions(subs: List[dict], current_id: Optional[str]) -> None:
+    table = Table(show_lines=False)
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Name", style="bold")
+    table.add_column("SubscriptionId", style="cyan")
+    table.add_column("State", style="magenta")
+    table.add_column("TenantId", style="dim")
+
+    for i, s in enumerate(subs, start=1):
+        is_current = s.get("id") == current_id
+        name = s.get("name", "")
+        subid = s.get("id", "")
+        state = s.get("state", "")
+        tenant = s.get("tenantId", "")
+        if is_current:
+            table.add_row(f"{i}", f"[green]▶ {name}[/green]", f"[green]{subid}[/green]", f"[green]{state}[/green]", f"[green]{tenant}[/green]")
+        else:
+            table.add_row(f"{i}", name, subid, state, tenant)
+
+    console.print(table)
+
+
+def set_subscription(sub_id_or_name: str) -> None:
+    # `az account set` does not accept -o json, so we run without -o and capture stderr
+    cmd = ["az", "account", "set", "--subscription", sub_id_or_name]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        console.print(f"[green]Switched to subscription:[/green] {sub_id_or_name}")
+    except FileNotFoundError:
+        console.print("[red]Azure CLI (`az`) not found on PATH.[/red]")
+        raise typer.Exit(2)
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.strip() if e.stderr else ""
+        console.print(f"[red]Failed to switch subscription:[/red] {stderr}")
+        raise typer.Exit(5)
+
+
+@app.command()
+def main(
+    subscription: Optional[str] = typer.Argument(None, help="Subscription id or name to switch to (optional)."),
+    yes: bool = typer.Option(False, "-y", "--yes", help="Don't ask for confirmation"),
+) -> None:
+    """List subscriptions and optionally switch the active subscription."""
+
+    subs = list_subscriptions()
+    if not subs:
+        console.print("[yellow]No subscriptions found.[/yellow]")
+        raise typer.Exit(0)
+
+    current = current_subscription()
+    current_id = current.get("id") if current else None
+
+    print_subscriptions(subs, current_id)
+
+    # If an argument was provided, try to directly switch
+    if subscription:
+        set_subscription(subscription)
+        raise typer.Exit(0)
+
+    # Otherwise prompt the user to pick an index
+    while True:
+        choice = typer.prompt("Enter subscription number to switch (q to quit)")
+        if choice.strip().lower() in ("q", "quit", "exit"):
+            console.print("[cyan]Nothing changed.[/cyan]")
+            raise typer.Exit(0)
+
+        if not choice.isdigit():
+            console.print("[red]Please enter a valid number or 'q' to quit.[/red]")
+            continue
+
+        idx = int(choice) - 1
+        if idx < 0 or idx >= len(subs):
+            console.print("[red]Index out of range.[/red]")
+            continue
+
+        target = subs[idx]
+        target_id = target.get("id")
+
+        if target_id == current_id:
+            console.print("[green]That subscription is already active.[/green]")
+            raise typer.Exit(0)
+
+        set_subscription(target_id)
+        raise typer.Exit(0)
+
+
+if __name__ == "__main__":
+    app()

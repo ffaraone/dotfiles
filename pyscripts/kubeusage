@@ -4,6 +4,9 @@
 # requires-python = ">=3.12"
 # dependencies = ["rich", "typer"]
 # ///
+"""
+Show k8s node cpu/memory usage with details about pods in each node and their cpu/memory consumption.
+"""
 
 import json
 import subprocess
@@ -13,7 +16,6 @@ from typing import List
 import typer
 from rich import box
 from rich.console import Console
-from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 

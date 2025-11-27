@@ -5,7 +5,7 @@ add_newline = false
 
 # Line 1: left (git, venv, cwd) + right (k8s, battery, time)
 # Line 2: prompt symbol only
-format = """($git_branch( $git_commit)( $git_status))( ≻$python)( ≻$directory)$fill(≺$kubernetes )(≺$battery )(≺$time)
+format = """$directory≻( $git_branch( $git_commit)( $git_status) ≻)( $python≻)$fill(≺$kubernetes )(≺$azure )(≺$battery )(≺$time)
 $character
 """
 
@@ -17,7 +17,7 @@ $character
 style = "bold fg:#585858" # CWD_THEME_PROMPT_COLOR=240
 truncation_length = 3
 read_only = " "
-format = " [$path]($style)[$read_only]($read_only_style) "
+format = "[$path]($style)[$read_only]($read_only_style) "
 
 [git_branch]
 format = "[$symbol$branch]($style)"
@@ -50,6 +50,12 @@ style = "bold fg:#00af5f" # PYTHON_VENV_THEME_PROMPT_COLOR=35
 disabled = false
 format = " [⎈ $context]($style)"
 style = "fg:#d70087" # KUBE_THEME_PROMPT_COLOR=161
+
+[azure]
+disabled = false
+format = '[$symbol($subscription)]($style)'
+symbol = '󰠅 '
+style = 'blue bold'
 
 [battery]
 disabled = false
