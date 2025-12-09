@@ -1,0 +1,270 @@
+#!/usr/bin/env -S uv run --script
+
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["rich", "typer"]
+# ///
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+import typer
+from rich import box
+from rich.console import Console
+from rich.table import Table
+
+app = typer.Typer()
+console = Console()
+
+
+def run(cmd: List[str], capture_output: bool = True, check: bool = True) -> subprocess.CompletedProcess:
+	try:
+		return subprocess.run(
+			cmd, capture_output=capture_output, text=True, check=check
+		)
+	except subprocess.CalledProcessError as e:
+		raise RuntimeError(
+			f"Command {cmd!r} failed (exit {e.returncode}): {e.stderr or e.stdout}"
+		)
+
+
+def get_repo_root() -> Path:
+	try:
+		p = run(["git", "rev-parse", "--show-toplevel"]).stdout.strip()
+		return Path(p)
+	except Exception as e:
+		raise typer.Exit(f"Cannot determine git repo root: {e}")
+
+
+def get_repo_owner_and_name() -> tuple[str, str]:
+	# Prefer `gh repo view` to retrieve owner/name
+	try:
+		cp = run(["gh", "repo", "view", "--json", "name,owner"])  # returns JSON
+		data = json.loads(cp.stdout)
+		name = data["name"]
+		owner = data["owner"]["login"]
+		return owner, name
+	except Exception:
+		# fallback to parsing remote URL
+		try:
+			out = run(["git", "config", "--get", "remote.origin.url"]).stdout.strip()
+			# possible formats: git@github.com:owner/repo.git or https://github.com/owner/repo.git
+			m = re.search(r"[:/]([^/]+?)/([^/]+?)(?:\.git)?$", out)
+			if m:
+				return m.group(1), m.group(2)
+		except Exception:
+			pass
+	raise typer.Exit("Could not determine repository owner/name. Make sure 'gh' is authenticated or remote origin is set.")
+
+
+@dataclass
+class WorkflowInfo:
+	id: int
+	name: str
+	path: str
+	state: str
+
+	@property
+	def enabled(self) -> bool:
+		return self.state == "active"
+
+
+def fetch_workflows(owner: str, repo: str) -> list[WorkflowInfo]:
+	try:
+		cp = run(["gh", "api", f"/repos/{owner}/{repo}/actions/workflows"]) 
+		data = json.loads(cp.stdout)
+		workflows = []
+		for w in data.get("workflows", []):
+			workflows.append(
+				WorkflowInfo(
+					id=w.get("id"), name=w.get("name"), path=w.get("path"), state=w.get("state", "disabled")
+				)
+			)
+		return workflows
+	except RuntimeError as e:
+		raise typer.Exit(f"Failed to fetch workflows: {e}")
+
+
+def dump_path(repo_root: Path | None = None) -> Path:
+	repo_root = repo_root or get_repo_root()
+	git_dir = repo_root / ".git"
+	if not git_dir.exists():
+		# In case .git is a file (git worktree or submodule), try using git rev-parse --git-dir
+		try:
+			gd = run(["git", "rev-parse", "--git-dir"]).stdout.strip()
+			git_dir = Path(gd)
+		except Exception as e:
+			raise typer.Exit(f"Cannot find .git directory: {e}")
+	return git_dir / "ghwfmgmt_dump.json"
+
+
+@app.command()
+def dump(file: Path | None = None):
+	"""Dump current workflows status from origin into .git/ghwfmgmt_dump.json (or custom file)."""
+	owner, repo = get_repo_owner_and_name()
+	workflows = fetch_workflows(owner, repo)
+	repo_root = get_repo_root()
+	path = Path(file) if file else dump_path(repo_root)
+	payload = {
+		"generated_at": datetime.utcnow().isoformat() + "Z",
+		"repo": {"owner": owner, "name": repo},
+		"workflows": {str(w.id): {"id": w.id, "name": w.name, "path": w.path, "enabled": w.enabled} for w in workflows},
+	}
+	path.parent.mkdir(parents=True, exist_ok=True)
+	path.write_text(json.dumps(payload, indent=2))
+	console.print(f"Saved {len(workflows)} workflows to {path}")
+
+
+@app.command("list")
+def list_wkf(file: Path | None = None):
+	"""List workflows from origin and compare with locally dumped statuses."""
+	owner, repo = get_repo_owner_and_name()
+	workflows = fetch_workflows(owner, repo)
+	repo_root = get_repo_root()
+	path = Path(file) if file else dump_path(repo_root)
+	local = {}
+	if path.exists():
+		try:
+			local = json.loads(path.read_text()).get("workflows", {})
+		except Exception:
+			console.print(f"[red]Failed to read local dump file {path}[/red]")
+
+	table = Table(box=box.ROUNDED, show_lines=False)
+	table.border_style = "blue"
+	table.add_column("ID", header_style="cyan", style="white", no_wrap=True)
+	table.add_column("Name", header_style="cyan", style="white")
+	table.add_column("Path", header_style="cyan", style="white")
+	table.add_column("Remote", header_style="cyan", style="white")
+	table.add_column("Local", header_style="cyan", style="white")
+
+	for w in workflows:
+		remote_status = "enabled" if w.enabled else "disabled"
+		local_info = local.get(str(w.id)) or next((v for v in local.values() if v.get("path") == w.path), None)
+		if local_info is None:
+			local_status = "-"
+			row_style = None
+		else:
+			local_status = "enabled" if local_info.get("enabled") else "disabled"
+			row_style = "bold red" if local_status != remote_status else None
+
+		table.add_row(str(w.id), w.name or "", w.path or "", remote_status, local_status, style=row_style)
+
+	console.print(table)
+	if not path.exists():
+		console.print(f"[yellow]No local dump found at {path}. Run `ghwfmgmt dump` to create one.[/yellow]")
+
+
+def set_workflow_state(owner: str, repo: str, workflow_id: int, enable: bool) -> None:
+	action = "enable" if enable else "disable"
+	try:
+		run(["gh", "api", "-X", "PUT", f"/repos/{owner}/{repo}/actions/workflows/{workflow_id}/{action}"])
+	except RuntimeError as e:
+		raise RuntimeError(f"Failed to {action} workflow {workflow_id}: {e}")
+
+
+@app.command()
+def sync(file: Path | None = None, dry: bool = False):
+	"""Apply the local dump statuses to origin (enable/disable workflows as needed)."""
+	owner, repo = get_repo_owner_and_name()
+	repo_root = get_repo_root()
+	path = Path(file) if file else dump_path(repo_root)
+	if not path.exists():
+		raise typer.Exit(f"No dump file found at {path}. Run `ghwfmgmt dump` first.")
+	data = json.loads(path.read_text())
+	local = data.get("workflows", {})
+	remote = {w.id: w for w in fetch_workflows(owner, repo)}
+
+	actions = []
+	for wid, info in local.items():
+		try:
+			wid_i = int(wid)
+		except ValueError:
+			continue
+		desired = bool(info.get("enabled"))
+		r = remote.get(wid_i)
+		if r is None:
+			console.print(f"[yellow]Workflow {wid_i} not present on remote; skipping[/yellow]")
+			continue
+		if r.enabled != desired:
+			actions.append((wid_i, desired, r))
+
+	if not actions:
+		console.print("Nothing to sync; local statuses match remote.")
+		raise typer.Exit()
+
+	for wid_i, desired, r in actions:
+		console.print(f"Applying {('enable' if desired else 'disable')} to {r.name} ({wid_i})")
+		if not dry:
+			try:
+				set_workflow_state(owner, repo, wid_i, desired)
+			except RuntimeError as e:
+				console.print(f"[red]{e}[/red]")
+
+
+def match_workflows(workflows: list[WorkflowInfo], target: str) -> list[WorkflowInfo]:
+	# numeric id
+	if re.fullmatch(r"\d+", target):
+		tid = int(target)
+		return [w for w in workflows if w.id == tid]
+
+	# treat as case-insensitive substring or regex
+	try:
+		pat = re.compile(target, re.IGNORECASE)
+		matched = [w for w in workflows if pat.search(w.name or "") or pat.search(w.path or "")]
+		return matched
+	except re.error:
+		# fallback to simple substring
+		return [w for w in workflows if target.lower() in (w.name or "").lower() or target.lower() in (w.path or "").lower()]
+
+
+@app.command()
+def enable(target: str):
+	"""Enable workflow by id or name/path pattern."""
+	owner, repo = get_repo_owner_and_name()
+	workflows = fetch_workflows(owner, repo)
+	matched = match_workflows(workflows, target)
+	if not matched:
+		raise typer.Exit(f"No workflows matched '{target}'")
+	for w in matched:
+		if w.enabled:
+			console.print(f"[green]{w.name} ({w.id}) is already enabled[/green]")
+			continue
+		console.print(f"Enabling {w.name} ({w.id})")
+		try:
+			set_workflow_state(owner, repo, w.id, True)
+		except RuntimeError as e:
+			console.print(f"[red]{e}[/red]")
+
+
+@app.command()
+def disable(target: str):
+	"""Disable workflow by id or name/path pattern."""
+	owner, repo = get_repo_owner_and_name()
+	workflows = fetch_workflows(owner, repo)
+	matched = match_workflows(workflows, target)
+	if not matched:
+		raise typer.Exit(f"No workflows matched '{target}'")
+	for w in matched:
+		if not w.enabled:
+			console.print(f"[green]{w.name} ({w.id}) is already disabled[/green]")
+			continue
+		console.print(f"Disabling {w.name} ({w.id})")
+		try:
+			set_workflow_state(owner, repo, w.id, False)
+		except RuntimeError as e:
+			console.print(f"[red]{e}[/red]")
+
+
+def main():
+	app()
+
+
+if __name__ == "__main__":
+	main()
+
