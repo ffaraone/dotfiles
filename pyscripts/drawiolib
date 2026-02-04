@@ -1,0 +1,361 @@
+#!/usr/bin/env -S uv run --script
+
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["typer", "rich"]
+# ///
+import json
+import xml.etree.ElementTree as ET
+import base64
+import zlib
+import urllib.parse
+from pathlib import Path
+from typing import Optional
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+app = typer.Typer(help="Convert SVGs to Native draw.io Shape Libraries", add_completion=False)
+console = Console()
+
+def svg_path_to_drawio(path_data: str) -> str:
+    """Convert SVG path data to draw.io path commands."""
+    import re
+    
+    drawio_commands = []
+    # Parse SVG path commands (simplified parser for common commands)
+    commands = re.findall(r'([MLHVCSQTAZ])([^MLHVCSQTAZ]*)', path_data, re.IGNORECASE)
+    
+    current_x, current_y = 0, 0
+    
+    for cmd, params in commands:
+        params = [float(p) for p in params.replace(',', ' ').split() if p.strip()]
+        
+        if cmd.upper() == 'M':  # Move
+            if len(params) >= 2:
+                current_x, current_y = params[0], params[1]
+                drawio_commands.append(f'<move x="{params[0]}" y="{params[1]}"/>')
+        elif cmd.upper() == 'L':  # Line
+            if len(params) >= 2:
+                current_x, current_y = params[0], params[1]
+                drawio_commands.append(f'<line x="{params[0]}" y="{params[1]}"/>')
+        elif cmd.upper() == 'H':  # Horizontal line
+            if params:
+                current_x = params[0]
+                drawio_commands.append(f'<line x="{params[0]}" y="{current_y}"/>')
+        elif cmd.upper() == 'V':  # Vertical line
+            if params:
+                current_y = params[0]
+                drawio_commands.append(f'<line x="{current_x}" y="{params[0]}"/>')
+        elif cmd.upper() == 'C':  # Cubic Bezier
+            if len(params) >= 6:
+                current_x, current_y = params[4], params[5]
+                drawio_commands.append(f'<curve x1="{params[0]}" y1="{params[1]}" x2="{params[2]}" y2="{params[3]}" x3="{params[4]}" y3="{params[5]}"/>')
+        elif cmd.upper() == 'Q':  # Quadratic Bezier
+            if len(params) >= 4:
+                current_x, current_y = params[2], params[3]
+                drawio_commands.append(f'<quad x1="{params[0]}" y1="{params[1]}" x2="{params[2]}" y2="{params[3]}"/>')
+        elif cmd.upper() == 'Z':  # Close path
+            drawio_commands.append('<close/>')
+    
+    return '\n            '.join(drawio_commands)
+
+
+def normalize_coordinate(coord: float, viewbox_min: float, viewbox_size: float, shape_size: float) -> float:
+    """Normalize a viewBox coordinate to shape coordinates (0 to shape_size)."""
+    return ((coord - viewbox_min) / viewbox_size * shape_size) if viewbox_size != 0 else 0
+
+
+def create_drawio_shape(svg_content: str, title: str) -> tuple[str, float, float]:
+    """
+    Converts SVG to draw.io native shape XML format.
+    Returns (shape_xml, width, height)
+    """
+    try:
+        svg_root = ET.fromstring(svg_content)
+        
+        # Get dimensions and viewBox
+        viewbox = svg_root.get('viewBox', None)
+        if viewbox:
+            parts = viewbox.split()
+            if len(parts) >= 4:
+                vb_x, vb_y, vb_width, vb_height = map(float, parts)
+            else:
+                vb_x, vb_y = 0, 0
+                vb_width = float(svg_root.get('width', '100').replace('px', '').replace('pt', ''))
+                vb_height = float(svg_root.get('height', '100').replace('px', '').replace('pt', ''))
+        else:
+            vb_x, vb_y = 0, 0
+            vb_width = float(svg_root.get('width', '100').replace('px', '').replace('pt', ''))
+            vb_height = float(svg_root.get('height', '100').replace('px', '').replace('pt', ''))
+        
+        # Use viewBox dimensions for the shape
+        width = vb_width
+        height = vb_height
+        
+        # Extract paths and basic shapes
+        foreground_elements = []
+        background_elements = []
+        
+        # Process paths
+        for path in svg_root.findall('.//{http://www.w3.org/2000/svg}path'):
+            d = path.get('d', '')
+            if d:
+                fill = path.get('fill', 'none')
+                stroke = path.get('stroke', 'none')
+                stroke_width = path.get('stroke-width', '1')
+                
+                path_xml = f"""
+        <path>
+            {svg_path_to_drawio(d)}
+        </path>"""
+                
+                if fill != 'none' and stroke != 'none':
+                    path_xml += "\n        <fillstroke/>"
+                elif fill != 'none':
+                    path_xml += "\n        <fill/>"
+                elif stroke != 'none':
+                    path_xml += "\n        <stroke/>"
+                
+                foreground_elements.append(path_xml)
+        
+        # Process polygons
+        for polygon in svg_root.findall('.//{http://www.w3.org/2000/svg}polygon'):
+            points = polygon.get('points', '')
+            if points:
+                fill = polygon.get('fill', 'none')
+                stroke = polygon.get('stroke', '#000000')
+                stroke_width = polygon.get('stroke-width', '1')
+                
+                # Parse points: "x1,y1 x2,y2 x3,y3" or "x1 y1 x2 y2 x3 y3"
+                coords = []
+                # Replace commas with spaces and split
+                points_cleaned = points.replace(',', ' ')
+                numbers = [float(n) for n in points_cleaned.split() if n.strip()]
+                
+                # Group into (x, y) pairs and normalize
+                for i in range(0, len(numbers), 2):
+                    if i + 1 < len(numbers):
+                        x = normalize_coordinate(numbers[i], vb_x, vb_width, width)
+                        y = normalize_coordinate(numbers[i+1], vb_y, vb_height, height)
+                        coords.append((x, y))
+                
+                if coords:
+                    polygon_path = f"<move x=\"{coords[0][0]}\" y=\"{coords[0][1]}\"/>"
+                    for x, y in coords[1:]:
+                        polygon_path += f"\n            <line x=\"{x}\" y=\"{y}\"/>"
+                    polygon_path += "\n            <close/>"
+                    
+                    polygon_xml = f"""
+        <path>
+            {polygon_path}
+        </path>"""
+                    
+                    if fill != 'none' and stroke != 'none':
+                        polygon_xml += "\n        <fillstroke/>"
+                    elif fill != 'none':
+                        polygon_xml += "\n        <fill/>"
+                    elif stroke != 'none':
+                        polygon_xml += "\n        <stroke/>"
+                    
+                    foreground_elements.append(polygon_xml)
+        
+        # Process circles
+        for circle in svg_root.findall('.//{http://www.w3.org/2000/svg}circle'):
+            cx = normalize_coordinate(float(circle.get('cx', '0')), vb_x, vb_width, width)
+            cy = normalize_coordinate(float(circle.get('cy', '0')), vb_y, vb_height, height)
+            r = float(circle.get('r', '0')) * width / vb_width if vb_width != 0 else 0
+            fill = circle.get('fill', 'white')
+            stroke = circle.get('stroke', '#000000')
+            
+            ellipse_xml = f"""
+        <ellipse x="{cx-r}" y="{cy-r}" w="{r*2}" h="{r*2}"/>"""
+            if fill != 'none' and stroke != 'none':
+                ellipse_xml += "\n        <fillstroke/>"
+            elif fill != 'none':
+                ellipse_xml += "\n        <fill/>"
+            elif stroke != 'none':
+                ellipse_xml += "\n        <stroke/>"
+            
+            foreground_elements.append(ellipse_xml)
+        
+        # Process rectangles
+        for rect in svg_root.findall('.//{http://www.w3.org/2000/svg}rect'):
+            x = normalize_coordinate(float(rect.get('x', '0')), vb_x, vb_width, width)
+            y = normalize_coordinate(float(rect.get('y', '0')), vb_y, vb_height, height)
+            w = float(rect.get('width', '0')) * width / vb_width if vb_width != 0 else 0
+            h = float(rect.get('height', '0')) * height / vb_height if vb_height != 0 else 0
+            fill = rect.get('fill', 'none')
+            stroke = rect.get('stroke', 'none')
+            
+            rect_xml = f"""
+        <rect x="{x}" y="{y}" w="{w}" h="{h}"/>"""
+            if fill != 'none' and stroke != 'none':
+                rect_xml += "\n        <fillstroke/>"
+            elif fill != 'none':
+                rect_xml += "\n        <fill/>"
+            elif stroke != 'none':
+                rect_xml += "\n        <stroke/>"
+            
+            foreground_elements.append(rect_xml)
+        
+        # Process text elements
+        for text in svg_root.findall('.//{http://www.w3.org/2000/svg}text'):
+            text_str = text.text or ""
+            if text_str:
+                x = normalize_coordinate(float(text.get('x', '0')), vb_x, vb_width, width)
+                y = normalize_coordinate(float(text.get('y', '0')), vb_y, vb_height, height)
+                font_size = text.get('font-size', '12')
+                font_size = float(font_size.replace('px', '').replace('pt', '')) if font_size else 12
+                text_align = text.get('text-anchor', 'left')
+                
+                # Map SVG text-anchor to draw.io align
+                align_map = {'start': 'left', 'middle': 'center', 'end': 'right'}
+                align = align_map.get(text_align, 'left')
+                
+                # Escape quotes in text
+                escaped_text = text_str.replace('"', '\\"')
+                
+                text_xml = f"""
+        <text x="{x}" y="{y}" align="{align}" fontsize="{int(font_size)}" str="{escaped_text}"/>"""
+                foreground_elements.append(text_xml)
+        
+        foreground = '\n        '.join(foreground_elements) if foreground_elements else '<path><move x="0" y="0"/><line x="{width}" y="{height}"/></path>\n        <stroke/>'
+        
+        # Create shape XML with transparent background and default styling
+        shape_xml = f"""<shape name="{title}" w="{width}" h="{height}" aspect="variable" strokewidth="inherit">
+    <connections>
+        <constraint x="0.5" y="0" perimeter="0" name="N"/>
+        <constraint x="0.5" y="1" perimeter="0" name="S"/>
+        <constraint x="0" y="0.5" perimeter="0" name="W"/>
+        <constraint x="1" y="0.5" perimeter="0" name="E"/>
+        <constraint x="0.15" y="0.15" perimeter="0" name="NW"/>
+        <constraint x="0.85" y="0.15" perimeter="0" name="NE"/>
+        <constraint x="0.85" y="0.85" perimeter="0" name="SE"/>
+        <constraint x="0.15" y="0.85" perimeter="0" name="SW"/>
+    </connections>
+    <background/>
+    <foreground>
+        {foreground}
+    </foreground>
+</shape>"""
+        
+        return shape_xml, width, height
+        
+    except ET.ParseError as e:
+        console.print(f"[red]Error:[/red] Invalid SVG format: {e}")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Error:[/red] Failed to process SVG: {e}")
+        raise typer.Exit(1)
+
+def encode_for_drawio(data_str: str) -> str:
+    """
+    Encode XML data for draw.io library format.
+    Uses pako deflate compression and base64 encoding.
+    """
+    # Encode to UTF-8 bytes
+    data_bytes = data_str.encode('utf-8')
+    # Compress using zlib (deflate algorithm)
+    compressed = zlib.compress(data_bytes, 9)
+    # Remove zlib header (2 bytes) and checksum (4 bytes)
+    deflated = compressed[2:-4]
+    # Base64 encode
+    return base64.b64encode(deflated).decode('utf-8')
+
+def load_library(lib_path: Path):
+    if not lib_path.exists():
+        return []
+    try:
+        tree = ET.parse(lib_path)
+        root = tree.getroot()
+        return json.loads(root.text) if root.text else []
+    except Exception:
+        return []
+
+def save_library(lib_path: Path, shapes: list):
+    library_root = ET.Element("mxlibrary")
+    library_root.text = json.dumps(shapes)
+    tree = ET.ElementTree(library_root)
+    tree.write(lib_path, encoding="utf-8", xml_declaration=True)
+
+@app.callback()
+def main(ctx: typer.Context, lib: Path = typer.Option("my_shapes.xml", "--lib", "-l")):
+    ctx.obj = lib
+
+@app.command()
+def add(
+    ctx: typer.Context, 
+    svg_path: Path = typer.Argument(...), 
+    name: Optional[str] = typer.Option(None, "--name", "-n")
+):
+    """Adds SVG as a native customizable draw.io shape with full style support."""
+    if not svg_path.exists():
+        console.print(f"[red]Error:[/red] {svg_path} not found.")
+        raise typer.Exit(1)
+
+    lib_path = ctx.obj
+    title = name if name else svg_path.stem
+    
+    # Read SVG content
+    with open(svg_path, 'r') as f:
+        svg_content = f.read()
+    
+    # Convert SVG to draw.io shape format
+    shape_xml, width, height = create_drawio_shape(svg_content, title)
+    
+    # Escape for uncompressed storage (as per docs)
+    escaped_xml = shape_xml.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '\\"')
+
+    shapes = load_library(lib_path)
+    shapes = [s for s in shapes if s.get('title') != title]  # Deduplicate
+
+    shapes.append({
+        "xml": escaped_xml,
+        "title": title,
+        "w": int(width),
+        "h": int(height),
+        "aspect": "variable"
+    })
+
+    save_library(lib_path, shapes)
+    console.print(f"[bold green]✔[/bold green] Integrated [magenta]{title}[/magenta] into [cyan]{lib_path}[/cyan] as a native shape.")
+
+@app.command()
+def list(ctx: typer.Context):
+    shapes = load_library(ctx.obj)
+    if not shapes:
+        console.print("[yellow]Library empty.[/yellow]")
+        return
+    table = Table(title=f"Library: {ctx.obj}")
+    table.add_column("Shape Name")
+    for s in shapes:
+        table.add_row(s['title'])
+    console.print(table)
+
+@app.command()
+def remove(ctx: typer.Context, name: str):
+    shapes = [s for s in load_library(ctx.obj) if s['title'] != name]
+    save_library(ctx.obj, shapes)
+    console.print(f"[green]Removed {name}[/green]")
+
+@app.command()
+def show(ctx: typer.Context, name: str):
+    """Display the XML definition of a shape by its title."""
+    shapes = load_library(ctx.obj)
+    shape = next((s for s in shapes if s.get('title') == name), None)
+    
+    if not shape:
+        console.print(f"[red]Error:[/red] Shape '{name}' not found in library.")
+        raise typer.Exit(1)
+    
+    # Unescape the XML
+    xml = shape.get('xml', '')
+    xml = xml.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').replace('\\"', '"')
+    
+    # Print to stdout (not using console.print to avoid formatting)
+    print(xml)
+
+if __name__ == "__main__":
+    app()
