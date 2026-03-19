@@ -26,9 +26,9 @@ console = Console()
 app = typer.Typer(help="Dump ContainerLogV2 logs from Azure Log Analytics workspaces")
 
 
-# Config file location
+# Config file location — shared with other az* tools at ~/.config/aztools
 def _config_dir() -> Path:
-    return Path.home() / '.config' / "azlogsdump"
+    return Path.home() / '.config' / 'aztools'
 
 
 def _config_file() -> Path:
@@ -37,6 +37,11 @@ def _config_file() -> Path:
 
 def load_config() -> dict:
     p = _config_file()
+    # Migrate from old per-tool location if needed
+    old_p = Path.home() / '.config' / 'azlogsdump' / 'config.json'
+    if not p.exists() and old_p.exists():
+        _config_dir().mkdir(parents=True, exist_ok=True)
+        p.write_text(old_p.read_text(encoding='utf-8'), encoding='utf-8')
     if not p.exists():
         return {}
     try:

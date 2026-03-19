@@ -13,6 +13,8 @@
 
 
 import json
+import re
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -73,7 +75,7 @@ def query_traces(
     trace_id: Optional[str] = None,
     minutes_back: int = 60,
     debug: bool = False,
-) -> List[Dict]:
+) -> list:
     """Query Application Insights for traces and spans"""
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(minutes=minutes_back)
@@ -703,13 +705,89 @@ def filename_for(base: str, output_dir: Optional[Path] = None) -> Path:
         counter += 1
 
 
-@app.command()
+# ── Shared config (~/.config/aztools/config.json) ──
+
+def _config_dir() -> Path:
+    return Path.home() / ".config" / "aztools"
+
+
+def _config_file() -> Path:
+    return _config_dir() / "config.json"
+
+
+def load_config() -> dict:
+    p = _config_file()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    d = _config_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    _config_file().write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+config_app = typer.Typer(help="Manage saved workspace ids (prod/dev/test/stage)")
+
+
+@config_app.command("set")
+def config_set(
+    prod: Optional[str] = typer.Option(None, "--prod", help="Set prod workspace id"),
+    dev: Optional[str] = typer.Option(None, "--dev", help="Set dev workspace id"),
+    test: Optional[str] = typer.Option(None, "--test", help="Set test workspace id"),
+    stage: Optional[str] = typer.Option(None, "--stage", help="Set stage workspace id"),
+) -> None:
+    """Set saved workspace ids in ~/.config/aztools/config.json"""
+    cfg = load_config()
+    changed = False
+    for env, value in [("prod", prod), ("dev", dev), ("test", test), ("stage", stage)]:
+        if value:
+            cfg[env] = value
+            changed = True
+    if changed:
+        save_config(cfg)
+        console.print("[green]Configuration updated.[/green]")
+    else:
+        console.print("No changes. Use --prod/--dev/--test/--stage to set values.")
+
+
+@config_app.command("show")
+def config_show() -> None:
+    """Show saved workspace ids"""
+    from rich import box
+    from rich.table import Table
+
+    cfg = load_config()
+    if not cfg:
+        console.print("[yellow]No workspaces configured.[/yellow]")
+        return
+    table = Table(title="Saved Workspaces", box=box.ROUNDED, border_style="blue", header_style="bold cyan")
+    table.add_column("Environment", style="cyan", no_wrap=True)
+    table.add_column("Workspace ID", style="white")
+    for env in ("prod", "stage", "dev", "test"):
+        if wid := cfg.get(env):
+            table.add_row(env, wid)
+    for k in sorted(cfg):
+        if k not in ("prod", "stage", "dev", "test"):
+            table.add_row(k, str(cfg[k]))
+    console.print(table)
+
+
+app.add_typer(config_app, name="config")
+
+
+@app.callback(invoke_without_command=True)
 def main(
-    workspace_id: str = typer.Option(
-        ...,
+    ctx: typer.Context,
+    workspace_id: Optional[str] = typer.Option(
+        None,
         "--workspace-id",
         "-w",
-        help="Azure Log Analytics Workspace ID",
+        help="Azure Log Analytics Workspace ID (overrides config/env)",
         envvar="AZURE_WORKSPACE_ID",
     ),
     operation_id: Optional[str] = typer.Option(
@@ -741,17 +819,37 @@ def main(
         "--debug",
         help="Enable debug mode to see queries and raw results",
     ),
+    prod: bool = typer.Option(False, "--prod", help="Use prod workspace from config"),
+    dev: bool = typer.Option(False, "--dev", help="Use dev workspace from config"),
+    test: bool = typer.Option(False, "--test", help="Use test workspace from config"),
+    stage: bool = typer.Option(False, "--stage", help="Use stage workspace from config"),
 ) -> None:
     """
-    Export traces and spans from Azure Application Insights to an interactive HTML treeview.
+    Export traces from Azure Application Insights to an interactive HTML treeview.
 
-    Requires AZURE_WORKSPACE_ID environment variable or --workspace-id option.
-    Authenticate with 'az login' before running.
+    Workspace can be set via --workspace-id, AZURE_WORKSPACE_ID env var,
+    or configured with: aztraceexp config set --prod <id>
     """
+    if ctx.invoked_subcommand is not None:
+        return
+
+    # Resolve workspace from shared config if not explicitly provided
+    if not workspace_id:
+        if sum([prod, dev, test, stage]) > 1:
+            console.print("[red]Error: Only one of --prod, --dev, --test, --stage can be used[/red]")
+            raise typer.Exit(code=1)
+        cfg = load_config()
+        env = "dev" if dev else "test" if test else "stage" if stage else "prod"
+        workspace_id = cfg.get(env)
+        if not workspace_id:
+            console.print(
+                f"[red]Error: No workspace configured for '{env}'.[/red]\n"
+                f"Run: aztraceexp config set --{env} <workspace-id>"
+            )
+            raise typer.Exit(code=1)
+
     if not operation_id and not trace_id:
-        console.print(
-            "[red]Error: Must provide either --operation-id or --trace-id[/red]"
-        )
+        console.print("[red]Error: Must provide either --operation-id or --trace-id[/red]")
         raise typer.Exit(code=1)
 
     with console.status("[bold green]Connecting to Azure..."):
@@ -768,9 +866,7 @@ def main(
         )
 
     if not rows:
-        console.print(
-            "[yellow]No traces found matching the criteria[/yellow]"
-        )
+        console.print("[yellow]No traces found matching the criteria[/yellow]")
         raise typer.Exit(code=0)
 
     console.print(f"[green]✓[/green] Found {len(rows)} spans")
@@ -790,4 +886,11 @@ def main(
 
 
 if __name__ == "__main__":
-    app()
+    if len(sys.argv) > 1 and sys.argv[1] == "config":
+        sys.argv.pop(1)
+        try:
+            config_app()
+        except SystemExit:
+            raise
+    else:
+        app()

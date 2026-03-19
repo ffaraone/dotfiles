@@ -1,0 +1,242 @@
+#!/usr/bin/env -S uv run --script
+
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["rich", "typer"]
+# ///
+
+"""Count outbound connections to a given port per pod and deployment."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Iterable, Optional
+
+import typer
+from rich import box
+from rich.console import Console
+from rich.table import Table
+
+app = typer.Typer(help="Count outbound connections to a given port per pod and deployment.")
+console = Console()
+
+PROC_FILES = ["/proc/net/tcp", "/proc/net/tcp6"]
+
+
+@dataclass(frozen=True)
+class PodInfo:
+	name: str
+	namespace: str
+	deployment: str
+	container: str
+
+
+def run_kubectl(cmd: list[str]) -> str:
+	try:
+		cp = subprocess.run(["kubectl"] + cmd, check=True, capture_output=True, text=True)
+		return cp.stdout
+	except subprocess.CalledProcessError as exc:
+		msg = exc.stderr or exc.stdout or str(exc)
+		raise typer.Exit(f"kubectl {' '.join(cmd)} failed: {msg.strip()}")
+
+
+def parse_proc_net_tcp(raw: str, target_port: int) -> int:
+	count = 0
+	for line in raw.splitlines():
+		if not line.strip() or line.lstrip().startswith("sl"):
+			continue
+		parts = line.split()
+		if len(parts) < 4:
+			continue
+		rem_addr = parts[2]
+		state = parts[3]
+		if state == "0A":
+			# LISTEN
+			continue
+		if ":" not in rem_addr:
+			continue
+		rem_port_hex = rem_addr.split(":", 1)[1]
+		try:
+			rem_port = int( , 16)
+		except ValueError:
+			continue
+		if rem_port == target_port:
+			count += 1
+	return count
+
+
+def deployment_from_pod(pod: dict) -> str:
+	owners = pod.get("metadata", {}).get("ownerReferences", [])
+	for owner in owners:
+		kind = owner.get("kind")
+		name = owner.get("name") or ""
+		if kind == "ReplicaSet" and name:
+			parts = name.rsplit("-", 1)
+			return parts[0] if len(parts) > 1 else name
+		if kind in {"Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"} and name:
+			return name
+	return "standalone"
+
+
+def select_container(pod: dict, preferred: Optional[str]) -> Optional[str]:
+	containers = [c.get("name") for c in pod.get("spec", {}).get("containers", []) if c.get("name")]
+	if not containers:
+		return None
+	if preferred:
+		return preferred if preferred in containers else None
+	return containers[0]
+
+
+def fetch_pods(namespaces: list[str]) -> list[dict]:
+	if namespaces and len(namespaces) == 1:
+		out = run_kubectl(["get", "pods", "-n", namespaces[0], "-o", "json"])
+	else:
+		out = run_kubectl(["get", "pods", "--all-namespaces", "-o", "json"])
+	data = json.loads(out)
+	items = data.get("items", [])
+	if namespaces:
+		ns_set = set(namespaces)
+		items = [p for p in items if p.get("metadata", {}).get("namespace") in ns_set]
+	return items
+
+
+def iter_pods(pods: Iterable[dict], deployment_filter: set[str] | None, preferred_container: Optional[str]) -> list[PodInfo]:
+	selected: list[PodInfo] = []
+	for pod in pods:
+		status = pod.get("status", {})
+		if status.get("phase") != "Running":
+			continue
+		name = pod.get("metadata", {}).get("name") or ""
+		namespace = pod.get("metadata", {}).get("namespace") or "default"
+		deployment = deployment_from_pod(pod)
+		if deployment_filter and deployment not in deployment_filter:
+			continue
+		container = select_container(pod, preferred_container)
+		if not container:
+			continue
+		selected.append(PodInfo(name=name, namespace=namespace, deployment=deployment, container=container))
+	return selected
+
+
+def count_outbound_connections(pod: PodInfo, target_port: int) -> int:
+	total = 0
+	for proc_file in PROC_FILES:
+		cmd = [
+			"exec",
+			"-n",
+			pod.namespace,
+			pod.name,
+			"-c",
+			pod.container,
+			"--",
+			"cat",
+			proc_file,
+		]
+		proc = subprocess.run(["kubectl"] + cmd, capture_output=True, text=True)
+		if proc.returncode != 0:
+			continue
+		total += parse_proc_net_tcp(proc.stdout, target_port)
+	return total
+
+
+def render_tables(rows: list[tuple[PodInfo, int]], show_zero: bool) -> None:
+	pod_table = Table(
+		title="Outbound connections per pod",
+		box=box.ROUNDED,
+		border_style="blue",
+		header_style="cyan bold",
+		show_lines=True,
+	)
+	pod_table.add_column("Namespace", style="cyan", no_wrap=True)
+	pod_table.add_column("Pod", style="bold")
+	pod_table.add_column("Deployment", style="white")
+	pod_table.add_column("Connections", style="green", justify="right")
+
+	deployment_totals: dict[str, int] = defaultdict(int)
+
+	for pod, count in rows:
+		if count == 0 and not show_zero:
+			continue
+		pod_table.add_row(pod.namespace, pod.name, pod.deployment, str(count))
+		deployment_totals[pod.deployment] += count
+
+	if not pod_table.row_count:
+		console.print("No matching pods with connections.")
+		return
+
+	dep_table = Table(
+		title="Outbound connections per deployment",
+		box=box.ROUNDED,
+		border_style="blue",
+		header_style="cyan bold",
+		show_lines=True,
+	)
+	dep_table.add_column("Deployment", style="bold")
+	dep_table.add_column("Connections", style="green", justify="right")
+
+	for deployment, count in sorted(deployment_totals.items(), key=lambda x: x[1], reverse=True):
+		if count == 0 and not show_zero:
+			continue
+		dep_table.add_row(deployment, str(count))
+
+	console.print("\n")
+	console.print(pod_table)
+	console.print("\n")
+	console.print(dep_table)
+	console.print("\n")
+
+
+@app.command()
+def main(
+	port: int = typer.Argument(..., help="Remote port to count outbound connections to."),
+	namespace: list[str] = typer.Option(
+		[],
+		"-n",
+		"--namespace",
+		help="Filter by namespace(s). Can be specified multiple times.",
+	),
+	deployment: list[str] = typer.Option(
+		[],
+		"-d",
+		"--deployment",
+		help="Filter by deployment(s). Can be specified multiple times.",
+	),
+	container: Optional[str] = typer.Option(
+		None,
+		"-c",
+		"--container",
+		help="Container name to exec into (defaults to first container in pod).",
+	),
+	show_zero: bool = typer.Option(
+		False,
+		"--show-zero",
+		help="Include pods and deployments with zero connections.",
+	),
+):
+	"""Count outbound connections to a given port per pod and deployment."""
+
+	if port <= 0 or port > 65535:
+		raise typer.BadParameter("port must be between 1 and 65535")
+
+	deployment_filter = set(deployment) if deployment else None
+
+	pods = fetch_pods(namespace)
+	selected = iter_pods(pods, deployment_filter, container)
+
+	if not selected:
+		console.print("No matching running pods.", style="yellow")
+		raise typer.Exit(1)
+
+	rows: list[tuple[PodInfo, int]] = []
+	for pod in selected:
+		count = count_outbound_connections(pod, port)
+		rows.append((pod, count))
+
+	render_tables(rows, show_zero)
+
+
+if __name__ == "__main__":
+	app()
