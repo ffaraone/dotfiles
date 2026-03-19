@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 import base64
 import zlib
 import urllib.parse
+import builtins
 from pathlib import Path
 from typing import Optional
 
@@ -67,6 +68,132 @@ def normalize_coordinate(coord: float, viewbox_min: float, viewbox_size: float, 
     return ((coord - viewbox_min) / viewbox_size * shape_size) if viewbox_size != 0 else 0
 
 
+def parse_length(value: str, default: float = 0.0) -> float:
+    if not value:
+        return default
+    return float(value.replace('px', '').replace('pt', ''))
+
+
+def encode_for_drawio_url(data_str: str) -> str:
+    """
+    Encode XML data for draw.io library format with URL encoding.
+    Uses pako deflate compression and base64 encoding.
+    """
+    quoted = urllib.parse.quote(data_str)
+    data_bytes = quoted.encode('utf-8')
+    compressed = zlib.compress(data_bytes, 9)
+    deflated = compressed[2:-4]
+    return base64.b64encode(deflated).decode('utf-8')
+
+
+def create_drawio_css_shape(svg_content: str, title: str, css_mode: str = "preserve") -> tuple[str, float, float]:
+    """
+    Converts SVG to a draw.io image cell with CSS customization.
+    Returns (encoded_mxgraph_xml, width, height)
+    """
+    svg_root = ET.fromstring(svg_content)
+
+    viewbox = svg_root.get('viewBox', None)
+    if viewbox:
+        parts = viewbox.split()
+        if len(parts) >= 4:
+            vb_x, vb_y, vb_width, vb_height = map(float, parts)
+        else:
+            vb_x, vb_y = 0, 0
+            vb_width = parse_length(svg_root.get('width', '100'), 100)
+            vb_height = parse_length(svg_root.get('height', '100'), 100)
+    else:
+        vb_x, vb_y = 0, 0
+        vb_width = parse_length(svg_root.get('width', '100'), 100)
+        vb_height = parse_length(svg_root.get('height', '100'), 100)
+
+    width = vb_width
+    height = vb_height
+
+    # Normalize SVG for CSS color control
+    svg_root.set('xmlns', svg_root.get('xmlns', 'http://www.w3.org/2000/svg'))
+    svg_root.set('viewBox', f"{vb_x} {vb_y} {vb_width} {vb_height}")
+    svg_root.set('width', str(int(width)))
+    svg_root.set('height', str(int(height)))
+
+    # Pick a default color from the SVG
+    default_color = None
+    for elem in svg_root.iter():
+        stroke = elem.get('stroke', None)
+        if stroke and stroke.lower() != 'none':
+            default_color = stroke
+            break
+        fill = elem.get('fill', None)
+        if fill and fill.lower() != 'none':
+            default_color = fill
+            break
+    if not default_color:
+        default_color = '#000000'
+
+    if css_mode not in {"preserve", "single"}:
+        css_mode = "preserve"
+
+    if css_mode == "single":
+        # Wrap all drawable content in a group with CSS class
+        group = ET.Element('g', {'class': 'color'})
+        children = builtins.list(svg_root)
+        svg_root.clear()
+        svg_root.set('xmlns', 'http://www.w3.org/2000/svg')
+        svg_root.set('viewBox', f"{vb_x} {vb_y} {vb_width} {vb_height}")
+        svg_root.set('width', str(int(width)))
+        svg_root.set('height', str(int(height)))
+
+        style = ET.SubElement(svg_root, 'style', {'type': 'text/css'})
+        style.text = '.color { stroke: currentColor; fill: currentColor; }'
+
+        for child in children:
+            if child.tag.endswith('defs'):
+                svg_root.append(child)
+                continue
+            group.append(child)
+
+        for elem in group.iter():
+            tag = elem.tag.split('}')[-1]
+            if tag in {'path', 'polygon', 'polyline', 'circle', 'rect', 'ellipse', 'line', 'text'}:
+                stroke = elem.get('stroke', None)
+                if stroke and stroke.lower() != 'none':
+                    elem.set('stroke', 'currentColor')
+                fill = elem.get('fill', None)
+                if fill and fill.lower() != 'none':
+                    elem.set('fill', 'currentColor')
+
+        svg_root.append(group)
+    else:
+        # Preserve original colors
+        svg_root.set('xmlns', svg_root.get('xmlns', 'http://www.w3.org/2000/svg'))
+        svg_root.set('viewBox', f"{vb_x} {vb_y} {vb_width} {vb_height}")
+        svg_root.set('width', str(int(width)))
+        svg_root.set('height', str(int(height)))
+
+    svg_xml = ET.tostring(svg_root, encoding='unicode')
+    svg_encoded = urllib.parse.quote(svg_xml)
+
+    style_str = (
+        'shape=image;editableCssRules=.*;verticalLabelPosition=bottom;'
+        'verticalAlign=top;imageAspect=0;aspect=fixed;'
+        f'{"color=" + default_color + ";" if css_mode == "single" else ""}'
+        f'image=data:image/svg+xml,{svg_encoded}'
+    )
+
+    mx_model = (
+        '<mxGraphModel><root>'
+        '<mxCell id="0"/>'
+        '<mxCell id="1" parent="0"/>'
+        f'<mxCell id="2" value="" style="{style_str}" vertex="1" parent="1">'
+        f'<mxGeometry width="{int(width)}" height="{int(height)}" as="geometry"/>'
+        '</mxCell>'
+        '</root></mxGraphModel>'
+    )
+
+    encoded = encode_for_drawio_url(mx_model)
+    return encoded, width, height
+
+
 def create_drawio_shape(svg_content: str, title: str) -> tuple[str, float, float]:
     """
     Converts SVG to draw.io native shape XML format.
@@ -74,7 +201,17 @@ def create_drawio_shape(svg_content: str, title: str) -> tuple[str, float, float
     """
     try:
         svg_root = ET.fromstring(svg_content)
-        
+
+        def normalize_color(color: str) -> str:
+            if not color:
+                return "none"
+            return color.strip().lower()
+
+        def parse_length(value: str, default: float = 0.0) -> float:
+            if not value:
+                return default
+            return float(value.replace('px', '').replace('pt', ''))
+
         # Get dimensions and viewBox
         viewbox = svg_root.get('viewBox', None)
         if viewbox:
@@ -83,166 +220,227 @@ def create_drawio_shape(svg_content: str, title: str) -> tuple[str, float, float
                 vb_x, vb_y, vb_width, vb_height = map(float, parts)
             else:
                 vb_x, vb_y = 0, 0
-                vb_width = float(svg_root.get('width', '100').replace('px', '').replace('pt', ''))
-                vb_height = float(svg_root.get('height', '100').replace('px', '').replace('pt', ''))
+                vb_width = parse_length(svg_root.get('width', '100'), 100)
+                vb_height = parse_length(svg_root.get('height', '100'), 100)
         else:
             vb_x, vb_y = 0, 0
-            vb_width = float(svg_root.get('width', '100').replace('px', '').replace('pt', ''))
-            vb_height = float(svg_root.get('height', '100').replace('px', '').replace('pt', ''))
-        
-        # Use viewBox dimensions for the shape
+            vb_width = parse_length(svg_root.get('width', '100'), 100)
+            vb_height = parse_length(svg_root.get('height', '100'), 100)
+
         width = vb_width
         height = vb_height
-        
-        # Extract paths and basic shapes
-        foreground_elements = []
-        background_elements = []
-        
-        # Process paths
+
+        # Collect unique stroke/fill colors
+        stroke_colors = {}
+        fill_colors = {}
+        stroke_idx = 0
+        fill_idx = 0
+
+        def register_color(color_map: dict, color_value: str, prefix: str) -> None:
+            nonlocal stroke_idx, fill_idx
+            if color_value == 'none':
+                return
+            if color_value in color_map:
+                return
+            if prefix == 'stroke':
+                stroke_idx += 1
+                color_map[color_value] = f"{prefix}Color{stroke_idx}"
+            else:
+                fill_idx += 1
+                color_map[color_value] = f"{prefix}Color{fill_idx}"
+
+        for polygon in svg_root.findall('.//{http://www.w3.org/2000/svg}polygon'):
+            register_color(stroke_colors, normalize_color(polygon.get('stroke', '#000000')), 'stroke')
+            register_color(fill_colors, normalize_color(polygon.get('fill', 'none')), 'fill')
+
+        for circle in svg_root.findall('.//{http://www.w3.org/2000/svg}circle'):
+            register_color(stroke_colors, normalize_color(circle.get('stroke', '#000000')), 'stroke')
+            register_color(fill_colors, normalize_color(circle.get('fill', 'none')), 'fill')
+
+        for rect in svg_root.findall('.//{http://www.w3.org/2000/svg}rect'):
+            register_color(stroke_colors, normalize_color(rect.get('stroke', 'none')), 'stroke')
+            register_color(fill_colors, normalize_color(rect.get('fill', 'none')), 'fill')
+
+        for path in svg_root.findall('.//{http://www.w3.org/2000/svg}path'):
+            register_color(stroke_colors, normalize_color(path.get('stroke', 'none')), 'stroke')
+            register_color(fill_colors, normalize_color(path.get('fill', 'none')), 'fill')
+
+        for text in svg_root.findall('.//{http://www.w3.org/2000/svg}text'):
+            register_color(fill_colors, normalize_color(text.get('fill', 'none')), 'fill')
+
+        # Create shape root
+        shape = ET.Element(
+            'shape',
+            {
+                'name': title,
+                'w': str(width),
+                'h': str(height),
+                'aspect': 'variable',
+                'strokewidth': 'inherit',
+            },
+        )
+
+        if stroke_colors:
+            shape.set('strokeColorStyles', ' '.join(stroke_colors.values()))
+        if fill_colors:
+            shape.set('fillColorStyles', ' '.join(fill_colors.values()))
+
+        if stroke_colors or fill_colors:
+            style_parts = [f"{name}={color}" for color, name in stroke_colors.items()]
+            style_parts += [f"{name}={color}" for color, name in fill_colors.items()]
+            shape.set('style', ';'.join(style_parts))
+
+        connections = ET.SubElement(shape, 'connections')
+        for name, x, y in (
+            ('N', '0.5', '0'),
+            ('S', '0.5', '1'),
+            ('W', '0', '0.5'),
+            ('E', '1', '0.5'),
+            ('NW', '0.15', '0.15'),
+            ('NE', '0.85', '0.15'),
+            ('SE', '0.85', '0.85'),
+            ('SW', '0.15', '0.85'),
+        ):
+            ET.SubElement(connections, 'constraint', {'x': x, 'y': y, 'perimeter': '0', 'name': name})
+
+        ET.SubElement(shape, 'background')
+        foreground = ET.SubElement(shape, 'foreground')
+
+        def add_color_tags(stroke: str, fill: str) -> None:
+            if stroke != 'none' and stroke in stroke_colors:
+                ET.SubElement(foreground, 'strokecolor', {'color': f"${stroke_colors[stroke]}"})
+            if fill != 'none' and fill in fill_colors:
+                ET.SubElement(foreground, 'fillcolor', {'color': f"${fill_colors[fill]}"})
+
+        # Paths
         for path in svg_root.findall('.//{http://www.w3.org/2000/svg}path'):
             d = path.get('d', '')
-            if d:
-                fill = path.get('fill', 'none')
-                stroke = path.get('stroke', 'none')
-                stroke_width = path.get('stroke-width', '1')
-                
-                path_xml = f"""
-        <path>
-            {svg_path_to_drawio(d)}
-        </path>"""
-                
-                if fill != 'none' and stroke != 'none':
-                    path_xml += "\n        <fillstroke/>"
-                elif fill != 'none':
-                    path_xml += "\n        <fill/>"
-                elif stroke != 'none':
-                    path_xml += "\n        <stroke/>"
-                
-                foreground_elements.append(path_xml)
-        
-        # Process polygons
+            if not d:
+                continue
+            fill = normalize_color(path.get('fill', 'none'))
+            stroke = normalize_color(path.get('stroke', 'none'))
+            add_color_tags(stroke, fill)
+
+            path_el = ET.SubElement(foreground, 'path')
+            wrapper = ET.fromstring(f"<w>{svg_path_to_drawio(d)}</w>")
+            for child in builtins.list(wrapper):
+                path_el.append(child)
+
+            if fill != 'none' and stroke != 'none':
+                ET.SubElement(foreground, 'fillstroke')
+            elif fill != 'none':
+                ET.SubElement(foreground, 'fill')
+            elif stroke != 'none':
+                ET.SubElement(foreground, 'stroke')
+
+        # Polygons
         for polygon in svg_root.findall('.//{http://www.w3.org/2000/svg}polygon'):
             points = polygon.get('points', '')
-            if points:
-                fill = polygon.get('fill', 'none')
-                stroke = polygon.get('stroke', '#000000')
-                stroke_width = polygon.get('stroke-width', '1')
-                
-                # Parse points: "x1,y1 x2,y2 x3,y3" or "x1 y1 x2 y2 x3 y3"
-                coords = []
-                # Replace commas with spaces and split
-                points_cleaned = points.replace(',', ' ')
-                numbers = [float(n) for n in points_cleaned.split() if n.strip()]
-                
-                # Group into (x, y) pairs and normalize
-                for i in range(0, len(numbers), 2):
-                    if i + 1 < len(numbers):
-                        x = normalize_coordinate(numbers[i], vb_x, vb_width, width)
-                        y = normalize_coordinate(numbers[i+1], vb_y, vb_height, height)
-                        coords.append((x, y))
-                
-                if coords:
-                    polygon_path = f"<move x=\"{coords[0][0]}\" y=\"{coords[0][1]}\"/>"
-                    for x, y in coords[1:]:
-                        polygon_path += f"\n            <line x=\"{x}\" y=\"{y}\"/>"
-                    polygon_path += "\n            <close/>"
-                    
-                    polygon_xml = f"""
-        <path>
-            {polygon_path}
-        </path>"""
-                    
-                    if fill != 'none' and stroke != 'none':
-                        polygon_xml += "\n        <fillstroke/>"
-                    elif fill != 'none':
-                        polygon_xml += "\n        <fill/>"
-                    elif stroke != 'none':
-                        polygon_xml += "\n        <stroke/>"
-                    
-                    foreground_elements.append(polygon_xml)
-        
-        # Process circles
+            if not points:
+                continue
+            fill = normalize_color(polygon.get('fill', 'none'))
+            stroke = normalize_color(polygon.get('stroke', '#000000'))
+            numbers = [float(n) for n in points.replace(',', ' ').split() if n.strip()]
+            coords = []
+            for i in range(0, len(numbers), 2):
+                if i + 1 < len(numbers):
+                    x = normalize_coordinate(numbers[i], vb_x, vb_width, width)
+                    y = normalize_coordinate(numbers[i + 1], vb_y, vb_height, height)
+                    coords.append((x, y))
+            if not coords:
+                continue
+
+            add_color_tags(stroke, fill)
+            path_el = ET.SubElement(foreground, 'path')
+            ET.SubElement(path_el, 'move', {'x': str(coords[0][0]), 'y': str(coords[0][1])})
+            for x, y in coords[1:]:
+                ET.SubElement(path_el, 'line', {'x': str(x), 'y': str(y)})
+            ET.SubElement(path_el, 'close')
+
+            if fill != 'none' and stroke != 'none':
+                ET.SubElement(foreground, 'fillstroke')
+            elif fill != 'none':
+                ET.SubElement(foreground, 'fill')
+            elif stroke != 'none':
+                ET.SubElement(foreground, 'stroke')
+
+        # Circles
         for circle in svg_root.findall('.//{http://www.w3.org/2000/svg}circle'):
             cx = normalize_coordinate(float(circle.get('cx', '0')), vb_x, vb_width, width)
             cy = normalize_coordinate(float(circle.get('cy', '0')), vb_y, vb_height, height)
             r = float(circle.get('r', '0')) * width / vb_width if vb_width != 0 else 0
-            fill = circle.get('fill', 'white')
-            stroke = circle.get('stroke', '#000000')
-            
-            ellipse_xml = f"""
-        <ellipse x="{cx-r}" y="{cy-r}" w="{r*2}" h="{r*2}"/>"""
+            fill = normalize_color(circle.get('fill', 'white'))
+            stroke = normalize_color(circle.get('stroke', '#000000'))
+            add_color_tags(stroke, fill)
+
+            ET.SubElement(
+                foreground,
+                'ellipse',
+                {'x': str(cx - r), 'y': str(cy - r), 'w': str(r * 2), 'h': str(r * 2)},
+            )
+
             if fill != 'none' and stroke != 'none':
-                ellipse_xml += "\n        <fillstroke/>"
+                ET.SubElement(foreground, 'fillstroke')
             elif fill != 'none':
-                ellipse_xml += "\n        <fill/>"
+                ET.SubElement(foreground, 'fill')
             elif stroke != 'none':
-                ellipse_xml += "\n        <stroke/>"
-            
-            foreground_elements.append(ellipse_xml)
-        
-        # Process rectangles
+                ET.SubElement(foreground, 'stroke')
+
+        # Rectangles
         for rect in svg_root.findall('.//{http://www.w3.org/2000/svg}rect'):
             x = normalize_coordinate(float(rect.get('x', '0')), vb_x, vb_width, width)
             y = normalize_coordinate(float(rect.get('y', '0')), vb_y, vb_height, height)
             w = float(rect.get('width', '0')) * width / vb_width if vb_width != 0 else 0
             h = float(rect.get('height', '0')) * height / vb_height if vb_height != 0 else 0
-            fill = rect.get('fill', 'none')
-            stroke = rect.get('stroke', 'none')
-            
-            rect_xml = f"""
-        <rect x="{x}" y="{y}" w="{w}" h="{h}"/>"""
+            fill = normalize_color(rect.get('fill', 'none'))
+            stroke = normalize_color(rect.get('stroke', 'none'))
+            add_color_tags(stroke, fill)
+
+            ET.SubElement(foreground, 'rect', {'x': str(x), 'y': str(y), 'w': str(w), 'h': str(h)})
+
             if fill != 'none' and stroke != 'none':
-                rect_xml += "\n        <fillstroke/>"
+                ET.SubElement(foreground, 'fillstroke')
             elif fill != 'none':
-                rect_xml += "\n        <fill/>"
+                ET.SubElement(foreground, 'fill')
             elif stroke != 'none':
-                rect_xml += "\n        <stroke/>"
-            
-            foreground_elements.append(rect_xml)
-        
-        # Process text elements
+                ET.SubElement(foreground, 'stroke')
+
+        # Text
         for text in svg_root.findall('.//{http://www.w3.org/2000/svg}text'):
-            text_str = text.text or ""
-            if text_str:
-                x = normalize_coordinate(float(text.get('x', '0')), vb_x, vb_width, width)
-                y = normalize_coordinate(float(text.get('y', '0')), vb_y, vb_height, height)
-                font_size = text.get('font-size', '12')
-                font_size = float(font_size.replace('px', '').replace('pt', '')) if font_size else 12
-                text_align = text.get('text-anchor', 'left')
-                
-                # Map SVG text-anchor to draw.io align
-                align_map = {'start': 'left', 'middle': 'center', 'end': 'right'}
-                align = align_map.get(text_align, 'left')
-                
-                # Escape quotes in text
-                escaped_text = text_str.replace('"', '\\"')
-                
-                text_xml = f"""
-        <text x="{x}" y="{y}" align="{align}" fontsize="{int(font_size)}" str="{escaped_text}"/>"""
-                foreground_elements.append(text_xml)
-        
-        foreground = '\n        '.join(foreground_elements) if foreground_elements else '<path><move x="0" y="0"/><line x="{width}" y="{height}"/></path>\n        <stroke/>'
-        
-        # Create shape XML with transparent background and default styling
-        shape_xml = f"""<shape name="{title}" w="{width}" h="{height}" aspect="variable" strokewidth="inherit">
-    <connections>
-        <constraint x="0.5" y="0" perimeter="0" name="N"/>
-        <constraint x="0.5" y="1" perimeter="0" name="S"/>
-        <constraint x="0" y="0.5" perimeter="0" name="W"/>
-        <constraint x="1" y="0.5" perimeter="0" name="E"/>
-        <constraint x="0.15" y="0.15" perimeter="0" name="NW"/>
-        <constraint x="0.85" y="0.15" perimeter="0" name="NE"/>
-        <constraint x="0.85" y="0.85" perimeter="0" name="SE"/>
-        <constraint x="0.15" y="0.85" perimeter="0" name="SW"/>
-    </connections>
-    <background/>
-    <foreground>
-        {foreground}
-    </foreground>
-</shape>"""
-        
+            text_str = (text.text or '').strip()
+            if not text_str:
+                continue
+            x = normalize_coordinate(float(text.get('x', '0')), vb_x, vb_width, width)
+            y = normalize_coordinate(float(text.get('y', '0')), vb_y, vb_height, height)
+            font_size = parse_length(text.get('font-size', '12'), 12)
+            font_family = text.get('font-family', 'Arial')
+            text_align = text.get('text-anchor', 'left')
+            text_fill = normalize_color(text.get('fill', '#000000'))
+
+            align_map = {'start': 'left', 'middle': 'center', 'end': 'right'}
+            align = align_map.get(text_align, 'left')
+
+            y_adjusted = max(0, min(height, y - (font_size * 0.25)))
+
+            ET.SubElement(foreground, 'fontsize', {'size': str(int(font_size))})
+            ET.SubElement(foreground, 'fontfamily', {'family': font_family})
+            if text_fill != 'none' and text_fill in fill_colors:
+                ET.SubElement(foreground, 'fontcolor', {'color': f"${fill_colors[text_fill]}"})
+            ET.SubElement(
+                foreground,
+                'text',
+                {
+                    'x': str(x),
+                    'y': str(y_adjusted),
+                    'align': align,
+                    'fontsize': str(int(font_size)),
+                    'str': text_str,
+                },
+            )
+
+        shape_xml = ET.tostring(shape, encoding='unicode')
         return shape_xml, width, height
-        
+
     except ET.ParseError as e:
         console.print(f"[red]Error:[/red] Invalid SVG format: {e}")
         raise typer.Exit(1)
@@ -275,6 +473,14 @@ def load_library(lib_path: Path):
         return []
 
 def save_library(lib_path: Path, shapes: list):
+    """Save shapes to library. XML should NOT be escaped in JSON."""
+    # First, unescape any XML that might be escaped from previous operations
+    for shape in shapes:
+        if 'xml' in shape and isinstance(shape['xml'], str):
+            # If it looks double-escaped (stored as &lt;shape...), unescape it safely
+            if shape['xml'].lstrip().startswith('&lt;shape'):
+                shape['xml'] = shape['xml'].replace('&lt;', '<').replace('&gt;', '>').replace('\\"', '"')
+    
     library_root = ET.Element("mxlibrary")
     library_root.text = json.dumps(shapes)
     tree = ET.ElementTree(library_root)
@@ -288,7 +494,9 @@ def main(ctx: typer.Context, lib: Path = typer.Option("my_shapes.xml", "--lib", 
 def add(
     ctx: typer.Context, 
     svg_path: Path = typer.Argument(...), 
-    name: Optional[str] = typer.Option(None, "--name", "-n")
+    name: Optional[str] = typer.Option(None, "--name", "-n"),
+    mode: str = typer.Option("css", "--mode", "-m", help="native|css"),
+    css_mode: str = typer.Option("preserve", "--css-mode", help="preserve|single")
 ):
     """Adds SVG as a native customizable draw.io shape with full style support."""
     if not svg_path.exists():
@@ -303,20 +511,20 @@ def add(
         svg_content = f.read()
     
     # Convert SVG to draw.io shape format
-    shape_xml, width, height = create_drawio_shape(svg_content, title)
-    
-    # Escape for uncompressed storage (as per docs)
-    escaped_xml = shape_xml.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '\\"')
+    if mode == "css":
+        shape_xml, width, height = create_drawio_css_shape(svg_content, title, css_mode)
+    else:
+        shape_xml, width, height = create_drawio_shape(svg_content, title)
 
     shapes = load_library(lib_path)
     shapes = [s for s in shapes if s.get('title') != title]  # Deduplicate
 
     shapes.append({
-        "xml": escaped_xml,
+        "xml": shape_xml,
         "title": title,
         "w": int(width),
         "h": int(height),
-        "aspect": "variable"
+        "aspect": "fixed" if mode == "css" else "variable"
     })
 
     save_library(lib_path, shapes)
@@ -350,12 +558,21 @@ def show(ctx: typer.Context, name: str):
         console.print(f"[red]Error:[/red] Shape '{name}' not found in library.")
         raise typer.Exit(1)
     
-    # Unescape the XML
     xml = shape.get('xml', '')
-    xml = xml.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').replace('\\"', '"')
-    
-    # Print to stdout (not using console.print to avoid formatting)
-    print(xml)
+    if xml.lstrip().startswith('<') or xml.lstrip().startswith('&lt;'):
+        xml = xml.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').replace('\\"', '"')
+        print(xml)
+        return
+
+    # Attempt to decode compressed mxGraphModel entries
+    try:
+        raw = base64.b64decode(xml)
+        decoded = zlib.decompress(raw, -15).decode('utf-8')
+        decoded = urllib.parse.unquote(decoded)
+        print(decoded)
+    except Exception:
+        # Fallback to raw content
+        print(xml)
 
 if __name__ == "__main__":
     app()
