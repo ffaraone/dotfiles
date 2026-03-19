@@ -40,6 +40,7 @@ class Span:
     result_code: Optional[str] = None
     message: Optional[str] = None
     span_type: Optional[str] = None
+    dependency_type: Optional[str] = None
     children: List["Span"] = field(default_factory=list)
 
 
@@ -97,7 +98,8 @@ def query_traces(
         success = Success,
         resultCode = ResultCode,
         message = coalesce(Message, Data, Url, ""),
-        type = Type
+        type = Type,
+        dependencyType = DependencyType
     | order by timestamp asc
     """
 
@@ -166,6 +168,7 @@ def parse_spans(rows: List) -> List[Span]:
             "resultCode": row[7] if len(row) > 7 else None,
             "message": row[8] if len(row) > 8 else None,
             "type": row[9] if len(row) > 9 else "Unknown",
+            "dependencyType": row[10] if len(row) > 10 else None,
         }
         
         # Handle None and missing values gracefully
@@ -200,6 +203,7 @@ def parse_spans(rows: List) -> List[Span]:
             result_code=data.get("resultCode"),
             message=data.get("message"),
             span_type=str(data.get("type", "Unknown")),
+            dependency_type=data.get("dependencyType"),
         )
         spans.append(span)
     return spans
@@ -288,6 +292,29 @@ def generate_html(
             text-transform: uppercase; letter-spacing: 0.5px;
         }}
         .tree-wrap {{ padding: 20px 24px; }}
+        /* ── legend ── */
+        .legend {{
+            padding: 16px 24px;
+            background: #f9fafb;
+            border-top: 1px solid #e5e7eb;
+            border-bottom: 1px solid #e5e7eb;
+        }}
+        .legend-title {{
+            font-size: 11px; font-weight: 700; color: #6b7280;
+            text-transform: uppercase; letter-spacing: 0.6px;
+            margin-bottom: 10px;
+        }}
+        .legend-grid {{
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 4px 16px;
+        }}
+        .legend-item {{
+            display: flex; align-items: center; gap: 8px;
+            font-size: 12px; color: #374151; padding: 3px 0;
+        }}
+        .legend-icon {{ font-size: 15px; width: 20px; text-align: center; flex-shrink: 0; }}
+        .legend-label {{ color: #6b7280; }}
         /* ── tree connectors ── */
         .tree-node {{
             position: relative;
@@ -410,6 +437,29 @@ def generate_html(
             <div class="stat-label">Total Duration</div>
         </div>
     </div>
+    <div class="legend">
+        <div class="legend-title">Legend</div>
+        <div class="legend-grid">
+            <div class="legend-item"><span class="legend-icon">🌐</span><span class="legend-label">HTTP Request (server)</span></div>
+            <div class="legend-item"><span class="legend-icon">🔗</span><span class="legend-label">HTTP / gRPC (outbound)</span></div>
+            <div class="legend-item"><span class="legend-icon">📤</span><span class="legend-label">Message producer</span></div>
+            <div class="legend-item"><span class="legend-icon">📥</span><span class="legend-label">Message consumer</span></div>
+            <div class="legend-item"><span class="legend-icon">📨</span><span class="legend-label">Message broker</span></div>
+            <div class="legend-item"><span class="legend-icon">🐬</span><span class="legend-label">MySQL</span></div>
+            <div class="legend-item"><span class="legend-icon">🐘</span><span class="legend-label">PostgreSQL</span></div>
+            <div class="legend-item"><span class="legend-icon">🍃</span><span class="legend-label">MongoDB</span></div>
+            <div class="legend-item"><span class="legend-icon">🔴</span><span class="legend-label">Redis</span></div>
+            <div class="legend-item"><span class="legend-icon">🪐</span><span class="legend-label">Cosmos DB</span></div>
+            <div class="legend-item"><span class="legend-icon">👁️</span><span class="legend-label">Cassandra</span></div>
+            <div class="legend-item"><span class="legend-icon">🔍</span><span class="legend-label">Elasticsearch</span></div>
+            <div class="legend-item"><span class="legend-icon">🗄️</span><span class="legend-label">SQL / generic DB</span></div>
+            <div class="legend-item"><span class="legend-icon">📦</span><span class="legend-label">Azure Storage</span></div>
+            <div class="legend-item"><span class="legend-icon">💥</span><span class="legend-label">Exception</span></div>
+            <div class="legend-item"><span class="legend-icon">📝</span><span class="legend-label">Trace / log</span></div>
+            <div class="legend-item"><span class="legend-icon">⚡</span><span class="legend-label">Dependency (other)</span></div>
+            <div class="legend-item"><span class="legend-icon">⬜</span><span class="legend-label">Unknown</span></div>
+        </div>
+    </div>
     <div class="toolbar">
         <button class="btn btn-primary" onclick="expandAll()">Expand All</button>
         <button class="btn" onclick="collapseAll()">Collapse All</button>
@@ -489,6 +539,72 @@ def _all_spans(spans: List[Span]) -> List[Span]:
     return all_spans
 
 
+def span_icon(span: "Span") -> str:
+    """Return an emoji icon that describes what the span does."""
+    stype = (span.span_type or "").lower()
+    dep = (span.dependency_type or "").lower()
+    name = (span.span_name or "").lower()
+    msg = (span.message or "").lower()
+
+    # Exceptions and traces first
+    if stype == "appexceptions":
+        return "💥"
+    if stype == "apptraces":
+        return "📝"
+
+    # Incoming HTTP request (server side)
+    if stype == "apprequests":
+        return "🌐"
+
+    # From here on it's AppDependencies — classify by DependencyType / name
+    # --- Message brokers ---
+    broker_keywords = ("servicebus", "service bus", "eventhub", "event hub",
+                       "rabbitmq", "rabbit", "kafka", "amqp", "sns", "sqs",
+                       "pubsub", "nats")
+    if any(k in dep or k in name or k in msg for k in broker_keywords):
+        # Distinguish producer vs consumer by name hints
+        if any(k in name for k in ("send", "publish", "produc", "enqueue", "emit")):
+            return "📤"
+        if any(k in name for k in ("receive", "consum", "subscri", "listen", "dequeue", "process")):
+            return "📥"
+        return "📨"
+
+    # --- Databases --- check dep/name/msg for each engine first, then fall back to SQL heuristics
+    if any(k in dep or k in name or k in msg for k in ("mysql",)):
+        return "🐬"
+    if any(k in dep or k in name or k in msg for k in ("postgres", "postgresql", " pg ")):
+        return "🐘"
+    if any(k in dep or k in name or k in msg for k in ("mongo",)):
+        return "🍃"
+    if any(k in dep or k in name or k in msg for k in ("redis",)):
+        return "🔴"
+    if any(k in dep or k in name or k in msg for k in ("cosmos", "cosmosdb")):
+        return "🪐"
+    if any(k in dep or k in name or k in msg for k in ("cassandra",)):
+        return "👁️"
+    if any(k in dep or k in name or k in msg for k in ("elastic", "opensearch")):
+        return "🔍"
+    # Generic SQL / unknown DB
+    if ("sql" in dep or dep in ("sql",)
+            or "sql" in name
+            or any(k in msg for k in ("select ", "insert ", "update ", "delete ", "exec "))):
+        return "🗄️"
+
+    # --- Azure storage ---
+    if any(k in dep or k in name for k in ("azure blob", "blob storage", "azure table", "azure storage", "azure queue")):
+        return "📦"
+
+    # --- Outbound HTTP / gRPC ---
+    if dep in ("http", "https", "grpc") or any(k in dep for k in ("http",)):
+        return "🔗"
+
+    # Fallback for any remaining dependency
+    if stype == "appdependencies":
+        return "⚡"
+
+    return "⬜"
+
+
 def _render_spans_html(spans: List[Span]) -> str:
     """Recursively render spans as HTML tree nodes"""
     if not spans:
@@ -498,7 +614,7 @@ def _render_spans_html(spans: List[Span]) -> str:
     for span in spans:
         ts = str(span.timestamp)[:19] if span.timestamp else ""
         failure_class = "" if span.success else " failure"
-        status = "✓" if span.success else "✗"
+        icon = span_icon(span)
 
         # Child-tree toggle (only if has children)
         if span.children:
@@ -533,6 +649,8 @@ def _render_spans_html(spans: List[Span]) -> str:
         detail_rows.append(("Duration", f"{fmt_duration(span.duration_ms)} ({span.duration_ms:.3f} ms)"))
         if span.span_type:
             detail_rows.append(("Type", span.span_type))
+        if span.dependency_type:
+            detail_rows.append(("Dependency Type", span.dependency_type))
         if span.result_code:
             detail_rows.append(("Result Code", span.result_code))
         if span.message:
@@ -550,7 +668,7 @@ def _render_spans_html(spans: List[Span]) -> str:
         parts.append(f"""<div class="tree-node">
   <div class="span-row{failure_class}" onclick="toggleDetail(this)">
     {child_btn}
-    <span class="status-icon">{'✅' if span.success else '❌'}</span>
+    <span class="status-icon">{icon}</span>
     <span class="span-name">{span.span_name}</span>
     <span class="span-meta">{type_badge}{code_badge}{dur}{ts_span}</span>
     <span class="detail-arrow">▼</span>
