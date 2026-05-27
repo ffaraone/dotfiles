@@ -1,0 +1,471 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["typer", "rich", "httpx", "openpyxl"]
+# ///
+
+"""FinOps organization resource report.
+
+Fetches all organizations from the FinOps API, reports cloud account counts
+and total tracked resources per organization, optionally broken down by
+cloud account.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import httpx
+import typer
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+from rich import box
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
+
+app = typer.Typer(help="FinOps organization resource report")
+console = Console()
+
+DEFAULT_BASE_URL = "https://api.finops.softwareone.com"
+
+IS_TENANT = lambda t: t.endswith("_tenant")  # noqa: E731
+
+CLOUD_TYPE_LABELS: dict[str, str] = {
+    "aws_cnr": "AWS",
+    "azure_cnr": "Azure",
+    "azure_tenant": "Azure (Tenant)",
+    "gcp_cnr": "GCP",
+    "gcp_tenant": "GCP (Tenant)",
+    "kubernetes_cnr": "Kubernetes",
+    "alibaba_cnr": "Alibaba Cloud",
+    "nebius": "Nebius",
+    "databricks": "Databricks",
+}
+
+CLOUD_TYPE_RICH: dict[str, str] = {
+    "aws_cnr": "yellow",
+    "azure_cnr": "bright_blue",
+    "azure_tenant": "blue",
+    "gcp_cnr": "green",
+    "gcp_tenant": "bright_green",
+    "kubernetes_cnr": "cyan",
+    "alibaba_cnr": "orange3",
+    "nebius": "magenta",
+    "databricks": "red",
+}
+
+CLOUD_TYPE_EXCEL_BG: dict[str, str] = {
+    "aws_cnr": "FF9900",
+    "azure_cnr": "0078D4",
+    "azure_tenant": "005A9E",
+    "gcp_cnr": "34A853",
+    "gcp_tenant": "1E7E34",
+    "kubernetes_cnr": "326CE5",
+    "alibaba_cnr": "FF6A00",
+    "nebius": "9B4CE8",
+    "databricks": "E02020",
+}
+
+
+class APIError(Exception):
+    pass
+
+
+@dataclass
+class CloudAccount:
+    id: str
+    name: str
+    type: str
+    resources: int
+
+
+@dataclass
+class OrgReport:
+    id: str
+    name: str
+    disabled: bool
+    accounts: list[CloudAccount] = field(default_factory=list)
+
+    @property
+    def total_accounts(self) -> int:
+        return len(self.accounts)
+
+    @property
+    def total_resources(self) -> int:
+        return sum(a.resources for a in self.accounts)
+
+
+# ── API helpers ────────────────────────────────────────────────────────────────
+
+async def _api_get(client: httpx.AsyncClient, base_url: str, path: str, **params: Any) -> Any:
+    url = f"{base_url.rstrip('/')}{path}"
+    resp = await client.get(url, params=params or None)
+    if resp.status_code >= 400:
+        console.print(f"[bold red]API error {resp.status_code}[/bold red] {path}: {resp.text[:300]}")
+        raise APIError(f"HTTP {resp.status_code} on {path}")
+    return resp.json()
+
+
+async def _fetch_org_accounts(
+    client: httpx.AsyncClient,
+    base_url: str,
+    org: dict[str, Any],
+    sem: asyncio.Semaphore,
+    exclude_disabled: bool,
+) -> OrgReport | None:
+    org_disabled = bool(org.get("disabled", False))
+    if exclude_disabled and org_disabled:
+        return None
+
+    async with sem:
+        accounts_data = await _api_get(
+            client, base_url,
+            f"/restapi/v2/organizations/{org['id']}/cloud_accounts",
+            details="true",
+        )
+
+    accounts: list[CloudAccount] = []
+    for acc in accounts_data.get("cloud_accounts", []):
+        acc_type = acc.get("type", "unknown")
+        if IS_TENANT(acc_type):
+            continue
+        resources = (acc.get("details") or {}).get("resources", 0)
+        accounts.append(CloudAccount(
+            id=acc["id"],
+            name=acc.get("name", "-"),
+            type=acc_type,
+            resources=int(resources),
+        ))
+
+    return OrgReport(
+        id=org["id"],
+        name=org.get("name", "-"),
+        disabled=org_disabled,
+        accounts=accounts,
+    )
+
+
+async def _fetch_report_async(
+    headers: dict[str, str],
+    base_url: str,
+    *,
+    exclude_disabled: bool,
+    parallelism: int,
+) -> list[OrgReport]:
+    async with httpx.AsyncClient(headers=headers, timeout=45) as client:
+        data = await _api_get(client, base_url, "/restapi/v2/organizations")
+        orgs = [o for o in data.get("organizations", []) if not o.get("is_demo")]
+
+        sem = asyncio.Semaphore(parallelism)
+        results = await asyncio.gather(*[
+            _fetch_org_accounts(client, base_url, org, sem, exclude_disabled)
+            for org in orgs
+        ])
+
+    return [r for r in results if r is not None]
+
+
+def fetch_report(
+    headers: dict[str, str],
+    base_url: str,
+    *,
+    exclude_disabled: bool = False,
+    parallelism: int = 5,
+) -> list[OrgReport]:
+    return asyncio.run(_fetch_report_async(
+        headers, base_url,
+        exclude_disabled=exclude_disabled,
+        parallelism=parallelism,
+    ))
+
+
+# ── Terminal output ────────────────────────────────────────────────────────────
+
+def _org_cell(org: OrgReport) -> Text:
+    t = Text()
+    t.append(org.name, style="bold white")
+    t.append(f"\n{org.id}", style="dim")
+    if org.disabled:
+        t.append("\nDISABLED", style="bold red")
+    else:
+        t.append("\nActive", style="green")
+    t.append("\nAccounts:  ", style="white")
+    t.append(str(org.total_accounts), style="bold green")
+    t.append("\nResources: ", style="white")
+    t.append(f"{org.total_resources:,}", style="bold yellow")
+    return t
+
+
+def _accounts_cell(accounts: list[CloudAccount]) -> Text:
+    if not accounts:
+        return Text("—", style="dim")
+
+    t = Text()
+    by_type: dict[str, list[CloudAccount]] = {}
+    for acc in sorted(accounts, key=lambda a: (a.type, a.name)):
+        by_type.setdefault(acc.type, []).append(acc)
+
+    first = True
+    for acc_type, accs in sorted(by_type.items()):
+        if not first:
+            t.append("\n")
+        first = False
+        label = CLOUD_TYPE_LABELS.get(acc_type, acc_type)
+        color = CLOUD_TYPE_RICH.get(acc_type, "white")
+        t.append(f"{label}\n", style=f"bold {color}")
+        for acc in accs:
+            t.append(f"  └─ {acc.name}", style="white")
+            t.append(f"  {acc.resources:,}\n", style="yellow")
+
+    return t
+
+
+def print_rich_report(report: list[OrgReport], detailed: bool) -> None:
+    if not detailed:
+        table = Table(
+            title="FinOps — Organization Summary",
+            box=box.ROUNDED,
+            header_style="bold cyan",
+            border_style="bright_blue",
+            show_lines=False,
+        )
+        table.add_column("Organization ID", style="dim", no_wrap=True)
+        table.add_column("Organization Name", style="bold white")
+        table.add_column("Disabled", justify="center", no_wrap=True)
+        table.add_column("Cloud Accounts", justify="right", style="green")
+        table.add_column("Total Resources", justify="right", style="yellow")
+
+        for org in report:
+            disabled_str = "[red]Yes[/red]" if org.disabled else "[green]No[/green]"
+            table.add_row(
+                org.id,
+                org.name,
+                disabled_str,
+                str(org.total_accounts),
+                f"{org.total_resources:,}",
+            )
+
+        console.print(table)
+        return
+
+    table = Table(
+        title="FinOps — Organization Report (detailed)",
+        box=box.ROUNDED,
+        header_style="bold cyan",
+        border_style="bright_blue",
+        show_lines=True,
+        expand=True,
+    )
+    table.add_column("Organization", min_width=32)
+    table.add_column("Cloud Accounts", min_width=40)
+
+    for org in report:
+        table.add_row(_org_cell(org), _accounts_cell(org.accounts))
+
+    console.print(table)
+
+
+# ── Excel output ───────────────────────────────────────────────────────────────
+
+def _excel_header_row(ws: Any, row: int, values: list[str]) -> None:
+    fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    font = Font(color="FFFFFF", bold=True, size=11)
+    align = Alignment(horizontal="center", vertical="center")
+    for col, v in enumerate(values, 1):
+        cell = ws.cell(row=row, column=col, value=v)
+        cell.fill = fill
+        cell.font = font
+        cell.alignment = align
+
+
+def _excel_auto_width(ws: Any) -> None:
+    for col in ws.columns:
+        width = max((len(str(c.value or "")) for c in col), default=0)
+        ws.column_dimensions[get_column_letter(col[0].column)].width = min(width + 4, 55)
+
+
+def write_excel(report: list[OrgReport], detailed: bool, output_path: Path) -> None:
+    wb = Workbook()
+
+    # ── Summary sheet ──────────────────────────────────────────────────
+    ws_sum = wb.active
+    ws_sum.title = "Summary"
+
+    seen_types = {acc.type for org in report for acc in org.accounts}
+    type_cols = [t for t in CLOUD_TYPE_LABELS if t in seen_types]
+    type_cols += sorted(seen_types - set(CLOUD_TYPE_LABELS))
+
+    FIXED_COLS = 5
+    total_cols = FIXED_COLS + len(type_cols)
+    last_col = get_column_letter(total_cols)
+
+    ws_sum.merge_cells(f"A1:{last_col}1")
+    title = ws_sum["A1"]
+    title.value = f"FinOps Organization Report  ·  {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    title.font = Font(bold=True, size=13, color="1F4E79")
+    title.alignment = Alignment(horizontal="center", vertical="center")
+    ws_sum.row_dimensions[1].height = 28
+
+    ws_sum.append([])
+
+    type_labels = [CLOUD_TYPE_LABELS.get(t, t) for t in type_cols]
+    _excel_header_row(
+        ws_sum, 3,
+        ["Organization ID", "Organization Name", "Disabled", "Cloud Accounts", "Total Resources"] + type_labels,
+    )
+    ws_sum.row_dimensions[3].height = 20
+
+    for j, t in enumerate(type_cols):
+        hex_bg = CLOUD_TYPE_EXCEL_BG.get(t)
+        if hex_bg:
+            cell = ws_sum.cell(row=3, column=FIXED_COLS + 1 + j)
+            cell.fill = PatternFill(start_color=hex_bg, end_color=hex_bg, fill_type="solid")
+
+    disabled_yes_fill = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
+    disabled_no_fill = PatternFill(start_color="CCFFCC", end_color="CCFFCC", fill_type="solid")
+    alt_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+
+    for i, org in enumerate(report):
+        r = 4 + i
+        type_counts = {t: sum(1 for a in org.accounts if a.type == t) for t in type_cols}
+        ws_sum.append([
+            org.id, org.name, "Yes" if org.disabled else "No",
+            org.total_accounts, org.total_resources,
+            *[type_counts[t] for t in type_cols],
+        ])
+        if i % 2 == 0:
+            for c in range(1, total_cols + 1):
+                ws_sum.cell(row=r, column=c).fill = alt_fill
+        disabled_cell = ws_sum.cell(row=r, column=3)
+        disabled_cell.fill = disabled_yes_fill if org.disabled else disabled_no_fill
+        disabled_cell.font = Font(bold=True, color="CC0000" if org.disabled else "006600")
+        disabled_cell.alignment = Alignment(horizontal="center")
+        for c in range(4, total_cols + 1):
+            ws_sum.cell(row=r, column=c).alignment = Alignment(horizontal="right")
+
+    ws_sum.freeze_panes = "A4"
+    _excel_auto_width(ws_sum)
+
+    # ── Cloud accounts sheet (detailed) ────────────────────────────────
+    if detailed:
+        ws_det = wb.create_sheet("Cloud Accounts")
+        _excel_header_row(
+            ws_det, 1,
+            ["Organization ID", "Organization Name", "Disabled", "Account ID", "Account Name", "Type", "Resources"],
+        )
+        ws_det.row_dimensions[1].height = 20
+
+        row_idx = 2
+        for i_org, org in enumerate(report):
+            org_alt = PatternFill(
+                start_color="E2F0D9" if i_org % 2 == 0 else "FFFFFF",
+                end_color="E2F0D9" if i_org % 2 == 0 else "FFFFFF",
+                fill_type="solid",
+            )
+            for acc in sorted(org.accounts, key=lambda a: (a.type, a.name)):
+                label = CLOUD_TYPE_LABELS.get(acc.type, acc.type)
+                ws_det.append([org.id, org.name, "Yes" if org.disabled else "No", acc.id, acc.name, label, acc.resources])
+
+                for c in range(1, 8):
+                    ws_det.cell(row=row_idx, column=c).fill = org_alt
+
+                d_cell = ws_det.cell(row=row_idx, column=3)
+                d_cell.fill = disabled_yes_fill if org.disabled else disabled_no_fill
+                d_cell.font = Font(bold=True, color="CC0000" if org.disabled else "006600")
+                d_cell.alignment = Alignment(horizontal="center")
+
+                type_cell = ws_det.cell(row=row_idx, column=6)
+                hex_bg = CLOUD_TYPE_EXCEL_BG.get(acc.type)
+                if hex_bg:
+                    type_cell.fill = PatternFill(start_color=hex_bg, end_color=hex_bg, fill_type="solid")
+                    type_cell.font = Font(color="FFFFFF", bold=True)
+                type_cell.alignment = Alignment(horizontal="center")
+
+                ws_det.cell(row=row_idx, column=7).alignment = Alignment(horizontal="right")
+                row_idx += 1
+
+        ws_det.freeze_panes = "A2"
+        _excel_auto_width(ws_det)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(output_path)
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+@app.command()
+def main(
+    cluster_secret: str | None = typer.Option(
+        None,
+        "--cluster-secret",
+        envvar="FINOPS_CLUSTER_SECRET",
+        help="Cluster secret passed as Secret: header. Reads FINOPS_CLUSTER_SECRET env var if omitted.",
+    ),
+    detailed: bool = typer.Option(
+        False,
+        "--detailed",
+        help="Also list every cloud account with its type and resource count.",
+    ),
+    exclude_disabled: bool = typer.Option(
+        False,
+        "--exclude-disabled",
+        help="Omit organizations that are disabled.",
+    ),
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        metavar="FILE.xlsx",
+        help="Export report to an Excel file (suppresses terminal output).",
+    ),
+    base_url: str = typer.Option(
+        DEFAULT_BASE_URL,
+        "--base-url",
+        help=f"API base URL (default: {DEFAULT_BASE_URL})",
+    ),
+    parallelism: int = typer.Option(
+        5,
+        "--parallelism",
+        help="Maximum concurrent cloud account requests.",
+        min=1,
+        max=50,
+    ),
+) -> None:
+    """Print a rich table summarizing organizations, cloud accounts, and resource counts."""
+    if not cluster_secret:
+        console.print("[bold red]Error:[/bold red] --cluster-secret is required (or set FINOPS_CLUSTER_SECRET).")
+        raise typer.Exit(1)
+
+    headers = {"Secret": cluster_secret, "Accept": "application/json"}
+
+    try:
+        with console.status("[bold green]Fetching organizations and cloud accounts…"):
+            report = fetch_report(
+                headers, base_url,
+                exclude_disabled=exclude_disabled,
+                parallelism=parallelism,
+            )
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        console.print(f"[bold red]Connection error:[/bold red] {exc}")
+        raise typer.Exit(1)
+    except APIError:
+        raise typer.Exit(1)
+
+    if not report:
+        console.print("[yellow]No organizations found.[/yellow]")
+        raise typer.Exit(0)
+
+    if output is not None:
+        write_excel(report, detailed, output)
+        console.print(f"[bold green]Excel report saved:[/bold green] {output}")
+    else:
+        print_rich_report(report, detailed)
+
+
+if __name__ == "__main__":
+    app()
