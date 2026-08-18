@@ -55,9 +55,17 @@ import typer
 from dateutil.relativedelta import relativedelta
 from httpx_retries import Retry, RetryTransport
 from openpyxl import Workbook
-from openpyxl.chart import AreaChart, LineChart, Reference
+from openpyxl.chart import BarChart, LineChart, Reference
 from openpyxl.chart.marker import Marker
 from openpyxl.chart.shapes import GraphicalProperties
+from openpyxl.chart.text import RichText, Text
+from openpyxl.chart.title import Title
+from openpyxl.drawing.text import (
+    CharacterProperties,
+    Paragraph,
+    ParagraphProperties,
+    RegularTextRun,
+)
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from rich.console import Console
@@ -83,7 +91,8 @@ DEFAULT_TARGET_CURRENCY = "EUR"
 CENTS = Decimal("0.01")
 RATE_PRECISION = Decimal("0.0001")
 MONEY_FORMAT = "#,##0.00"
-AXIS_FORMAT = "#,##0"
+# thousands as "12k", but amounts below 1000 stay readable instead of rounding to "0k"
+AXIS_FORMAT = '[>=1000]#,##0,"k";#,##0'
 RATE_FORMAT = "#,##0.0000"
 TOTAL_COLOR = "1F3864"  # aggregate series, kept out of the datasource type colors
 # known datasource types, in the order they appear in the report
@@ -452,8 +461,10 @@ MONTH_FILL = PatternFill("solid", fgColor="F2F6FC")  # every other month, to tel
 MONTH_RULE = Side(style="medium", color="8EAADB")  # between months, over the data rows
 MONTH_HEADER_RULE = Side(style="medium", color="FFFFFF")  # the same, over the header rows
 LINE_WIDTH_EMU = 28575  # 2.25pt, thin enough to read several series at once
-BAND_EDGE_EMU = 12700  # 1pt, the surface gap between two stacked areas
+SEGMENT_EDGE_EMU = 12700  # 1pt, the surface gap between two stacked segments
 HEADER_HEIGHT = 46
+CHART_TITLE_SIZE = 1600  # hundredths of a point
+CHART_TITLE_COLOR = "1F3864"
 CHART_WIDTH_CM = 18
 CHART_HEIGHT_CM = 8
 DEFAULT_COLUMN_WIDTH = 8.43  # characters, what Excel gives a column nobody sized
@@ -508,17 +519,13 @@ def chart_column_span(sheet, first_column: int) -> int:
     return span
 
 
-def write_panel_title(sheet, text: str, row: int, column: int, span: int) -> None:
-    """Heading of a chart panel, styled like the header of a table."""
-    cell = sheet.cell(row=row, column=column, value=text)
-    cell.font = HEADER_FONT
-    cell.alignment = Alignment(horizontal="center", vertical="center")
-    for offset in range(span):  # the band has to cover the merged range
-        panel_cell = sheet.cell(row=row, column=column + offset)
-        panel_cell.fill = HEADER_FILL
-        panel_cell.border = HEADER_BORDER
-    sheet.merge_cells(start_row=row, start_column=column, end_row=row, end_column=column + span - 1)
-    sheet.row_dimensions[row].height = HEADER_HEIGHT
+def build_chart_title(text: str) -> Title:
+    """Chart title, larger than the Excel default and above the plot area, not over it."""
+    font = CharacterProperties(sz=CHART_TITLE_SIZE, b=True, solidFill=CHART_TITLE_COLOR)
+    paragraph = Paragraph(
+        pPr=ParagraphProperties(defRPr=font), r=[RegularTextRun(t=text, rPr=font)]
+    )
+    return Title(tx=Text(rich=RichText(p=[paragraph])), overlay=False)
 
 
 def add_left_rule(cell, side: Side) -> None:
@@ -594,23 +601,30 @@ def present_datasource_types(rows: list[OrganizationRow]) -> list[str]:
 
 def add_monthly_chart(
     sheet,
+    title: str,
     columns: list[int],
     periods: list[Period],
     colors: list[str],
     currency: str,
-    stacked: bool = False,
-) -> AreaChart | LineChart:
+    bars: bool = False,
+) -> BarChart | LineChart:
     """
-    One measure over the reported periods as a line, a breakdown as stacked areas.
+    One measure over the reported periods as a line, a breakdown as clustered columns.
 
-    Stacked areas show that the series add up to a total, which stacked lines only
-    imply. The chart carries no title of its own: it hangs under a panel heading
-    written on the sheet, see ``write_panel_title``.
+    Clustered columns compare the series month by month; they are not stacked, so the
+    bars of a month do not add up to its total by eye.
     """
-    chart = AreaChart() if stacked else LineChart()
-    chart.grouping = "stacked" if stacked else "standard"
+    chart = BarChart() if bars else LineChart()
+    if bars:
+        chart.type = "col"
+        chart.grouping = "clustered"
+        chart.overlap = 0  # the columns of a month touch without overlapping
+        chart.gapWidth = 60
+    else:
+        chart.grouping = "standard"
+    chart.title = build_chart_title(title)
     chart.y_axis.title = currency
-    chart.y_axis.numFmt = AXIS_FORMAT  # whole units, the cents belong in the table
+    chart.y_axis.numFmt = AXIS_FORMAT  # thousands, the cents belong in the table
     chart.x_axis.delete = False  # openpyxl defaults would hide the axes in Excel
     chart.y_axis.delete = False
     chart.height = CHART_HEIGHT_CM
@@ -623,10 +637,10 @@ def add_monthly_chart(
         )
     chart.set_categories(Reference(sheet, min_col=1, min_row=FIRST_DATA_ROW, max_row=last_row))
     for series, color in zip(chart.series, colors):
-        if stacked:
+        if bars:
             series.graphicalProperties.solidFill = color
-            series.graphicalProperties.line.solidFill = "FFFFFF"  # a gap between the bands
-            series.graphicalProperties.line.width = BAND_EDGE_EMU
+            series.graphicalProperties.line.solidFill = "FFFFFF"  # a gap between the columns
+            series.graphicalProperties.line.width = SEGMENT_EDGE_EMU
             continue
         series.graphicalProperties.line.solidFill = color
         series.graphicalProperties.line.width = LINE_WIDTH_EMU
@@ -706,34 +720,25 @@ def write_summary_sheet(
 
     total_billed_column = len(headers)
     anchor_column = get_column_letter(chart_column)
-    title_row = HEADER_ROW  # level with the table header, so the two read as one band
-    write_panel_title(
-        sheet,
-        "Billed per month",
-        title_row,
-        chart_column,
-        chart_span,
-    )
     sheet.add_chart(
-        add_monthly_chart(sheet, [total_billed_column], periods, [TOTAL_COLOR], currency),
-        f"{anchor_column}{title_row + 1}",
+        add_monthly_chart(
+            sheet, "Billed per month", [total_billed_column], periods, [TOTAL_COLOR], currency
+        ),
+        f"{anchor_column}{HEADER_ROW + 2}",
     )
     if len(types) > 1:  # with a single datasource type the chart above says it all
         first_billed_column = 2 + len(types) + 1
-        title_row = HEADER_ROW + 19  # below the first chart, whatever the period count
-        write_panel_title(
-            sheet, "Billed per month by datasource type", title_row, chart_column, chart_span
-        )
         sheet.add_chart(
             add_monthly_chart(
                 sheet,
+                "Billed per month by datasource type",
                 list(range(first_billed_column, first_billed_column + len(types))),
                 periods,
                 DATASOURCE_COLORS,
                 currency,
-                stacked=True,
+                bars=True,
             ),
-            f"{anchor_column}{title_row + 1}",
+            f"{anchor_column}{HEADER_ROW + 19}",
         )
 
 
