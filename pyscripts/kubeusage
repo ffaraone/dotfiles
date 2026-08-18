@@ -222,6 +222,13 @@ def main(
         console.print("[red]Failed to get node or pod information")
         return
 
+    def parse_percent(s):
+        val = s.rstrip("%")
+        try:
+            return int(val)
+        except ValueError:
+            return 0
+
     # Process node metrics
     node_metrics = {}
     for line in node_metrics_raw:
@@ -230,9 +237,9 @@ def main(
             if len(parts) >= 5:
                 name = parts[0]
                 cpu_usage = parts[1]
-                cpu_percent = int(parts[2].rstrip("%"))
+                cpu_percent = parse_percent(parts[2])
                 memory_usage = parts[3]
-                memory_percent = int(parts[4].rstrip("%"))
+                memory_percent = parse_percent(parts[4])
                 node_metrics[name] = {
                     "cpu_usage": cpu_usage,
                     "cpu_percent": cpu_percent,

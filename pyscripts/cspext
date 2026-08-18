@@ -1,0 +1,1352 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["rich", "typer", "httpx", "httpx-retries"]
+# ///
+
+"""cspext — interact with a CSP extension via its API.
+
+Every command needs four things to reach the API:
+
+  * api_url            — base URL of the API
+  * api key            — Bearer token (never stored on disk)
+  * extension id       — the extension to operate on
+  * vendor account id  — the vendor account owning the extension
+
+The extension id, vendor account id and api_url are saved per environment
+with the `setup` command, so you can later run e.g. `cspext --env TEST ...`
+and only be asked for the API key.
+
+The API key is deliberately never persisted. It is resolved, in order:
+  1. --api-key on the command line (discouraged — appears in shell history)
+  2. the CSPEXT_API_KEY environment variable
+  3. --api-key-file <path>   (or --api-key-stdin to read from a pipe)
+  4. a hidden interactive prompt (no echo, no history)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+import httpx
+import typer
+from httpx_retries import Retry, RetryTransport
+from rich import box
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
+from rich.table import Table
+
+console = Console()
+app = typer.Typer(
+    help="Interact with a CSP extension via its API.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+
+API_KEY_ENV = "CSPEXT_API_KEY"
+HTTP_TIMEOUT = 30.0
+
+# Retry defaults for idempotent requests (GET/PUT/DELETE/HEAD/OPTIONS; POST is
+# never retried). Backoff is exponential: backoff_factor * 2**(attempt-1).
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_BACKOFF_FACTOR = 0.5
+DEFAULT_MAX_BACKOFF = 30.0
+
+
+class OutputFormat(str, Enum):
+    TABLE = "table"
+    JSON = "json"
+
+# Health-check path used by `check`. Adjust to the real API resource once
+# the endpoint is confirmed; {vendor_account_id} / {extension_id} are filled in.
+CHECK_PATH = "/public/v1/integration/extensions/{extension_id}"
+
+
+# ── Config storage ───────────────────────────────────────────────────────────
+
+def _config_dir() -> Path:
+    return Path.home() / ".config" / "cspext"
+
+
+def _config_file() -> Path:
+    return _config_dir() / "config.json"
+
+
+def load_config() -> dict[str, Any]:
+    p = _config_file()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        console.print(f"[yellow]Warning: could not parse {p}; ignoring.[/yellow]")
+        return {}
+
+
+def save_config(cfg: dict[str, Any]) -> None:
+    d = _config_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    _config_file().write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+def _environments(cfg: dict[str, Any]) -> dict[str, Any]:
+    return cfg.setdefault("environments", {})
+
+
+# ── Runtime context ────────────────────────────────────────────────────────────
+
+@dataclass
+class GlobalOpts:
+    """Raw options captured by the root callback, resolved lazily per command."""
+
+    env: str | None
+    api_url: str | None
+    extension_id: str | None
+    vendor_account_id: str | None
+    api_key: str | None
+    api_key_file: Path | None
+    api_key_stdin: bool
+    max_retries: int
+    backoff_factor: float
+    max_backoff: float
+
+
+@dataclass
+class Runtime:
+    """Fully-resolved settings every API command needs."""
+
+    env: str | None
+    api_url: str
+    extension_id: str
+    vendor_account_id: str
+    api_key: str
+    max_retries: int
+    backoff_factor: float
+    max_backoff: float
+
+    @property
+    def headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Accept": "application/json",
+        }
+
+
+def _resolve_api_key(opts: GlobalOpts) -> str:
+    """Resolve the API key without letting it leak into shell history."""
+    if opts.api_key:
+        return opts.api_key.strip()
+
+    env_key = os.environ.get(API_KEY_ENV)
+    if env_key:
+        return env_key.strip()
+
+    if opts.api_key_file is not None:
+        try:
+            return opts.api_key_file.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise typer.BadParameter(f"Could not read API key file: {exc}")
+
+    if opts.api_key_stdin:
+        key = sys.stdin.readline().strip()
+        if not key:
+            raise typer.BadParameter("No API key received on stdin.")
+        return key
+
+    if not sys.stdin.isatty():
+        raise typer.BadParameter(
+            "No API key available. Provide it via "
+            f"${API_KEY_ENV}, --api-key-file, --api-key-stdin or run interactively."
+        )
+
+    return typer.prompt("API key", hide_input=True).strip()
+
+
+def resolve_runtime(opts: GlobalOpts) -> Runtime:
+    """Merge saved environment config with CLI overrides and the API key."""
+    cfg = load_config()
+    envs = _environments(cfg)
+
+    env_name = opts.env or cfg.get("default_env")
+    saved: dict[str, Any] = {}
+    if env_name:
+        saved = envs.get(env_name, {})
+        if not saved and opts.env:
+            available = ", ".join(sorted(envs)) or "none"
+            raise typer.BadParameter(
+                f"Environment '{env_name}' is not configured. "
+                f"Run `cspext --env {env_name} setup`. Available: {available}"
+            )
+
+    api_url = opts.api_url or saved.get("api_url")
+    extension_id = opts.extension_id or saved.get("extension_id")
+    vendor_account_id = opts.vendor_account_id or saved.get("vendor_account_id")
+
+    missing = [
+        name
+        for name, val in (
+            ("api_url", api_url),
+            ("extension_id", extension_id),
+            ("vendor_account_id", vendor_account_id),
+        )
+        if not val
+    ]
+    if missing:
+        raise typer.BadParameter(
+            "Missing required settings: "
+            + ", ".join(missing)
+            + ". Provide them via `setup` (per environment) or as options."
+        )
+
+    api_key = _resolve_api_key(opts)
+
+    return Runtime(
+        env=env_name,
+        api_url=api_url.rstrip("/"),
+        extension_id=extension_id,
+        vendor_account_id=vendor_account_id,
+        api_key=api_key,
+        max_retries=opts.max_retries,
+        backoff_factor=opts.backoff_factor,
+        max_backoff=opts.max_backoff,
+    )
+
+
+# ── HTTP layer ─────────────────────────────────────────────────────────────────
+
+class APIError(Exception):
+    pass
+
+
+def new_async_client(rt: Runtime) -> httpx.AsyncClient:
+    """AsyncClient that retries idempotent requests with exponential backoff.
+
+    Only idempotent methods (GET/PUT/DELETE/HEAD/OPTIONS/TRACE) and transient
+    statuses (429/502/503/504) are retried; POST is never retried.
+    """
+    retry = Retry(
+        total=rt.max_retries,
+        backoff_factor=rt.backoff_factor,
+        max_backoff_wait=rt.max_backoff,
+    )
+    return httpx.AsyncClient(
+        base_url=rt.api_url,
+        headers=rt.headers,
+        timeout=HTTP_TIMEOUT,
+        transport=RetryTransport(retry=retry),
+    )
+
+
+async def api_request(
+    rt: Runtime,
+    method: str,
+    path: str,
+    **kwargs: Any,
+) -> httpx.Response:
+    async with new_async_client(rt) as client:
+        resp = await client.request(method, path, **kwargs)
+    return resp
+
+
+def _format_path(template: str, rt: Runtime) -> str:
+    return template.format(
+        vendor_account_id=rt.vendor_account_id,
+        extension_id=rt.extension_id,
+    )
+
+
+def raise_for_api_error(resp: httpx.Response) -> None:
+    """Report auth/API errors uniformly and abort the command."""
+    if resp.status_code in (401, 403):
+        console.print(
+            f"[bold red]Authentication failed[/bold red] (HTTP {resp.status_code})."
+        )
+        raise typer.Exit(1)
+    if resp.status_code >= 400:
+        console.print(
+            f"[bold red]API error {resp.status_code}[/bold red]: {resp.text[:300]}"
+        )
+        raise typer.Exit(1)
+
+
+async def fetch_all_pages(
+    rt: Runtime, path: str, *, page_size: int = 100, parallelism: int = 10
+) -> list[dict[str, Any]]:
+    """Fetch every page of a `data`/`$meta.pagination` list endpoint.
+
+    `path` may already carry a query string (e.g. an RQL filter); `limit`
+    and `offset` are appended for each page. The first page is fetched to learn
+    the total, then the remaining pages are fetched concurrently (at most
+    `parallelism` in flight) and reassembled in offset order.
+    """
+    sep = "&" if "?" in path else "?"
+
+    async with new_async_client(rt) as client:
+        async def get_page(offset: int) -> dict[str, Any]:
+            resp = await client.request(
+                "GET", f"{path}{sep}limit={page_size}&offset={offset}"
+            )
+            raise_for_api_error(resp)
+            return resp.json()
+
+        first = await get_page(0)
+        results: list[dict[str, Any]] = list(first.get("data") or [])
+
+        pagination = (first.get("$meta") or {}).get("pagination") or {}
+        total = pagination.get("total")
+        limit = pagination.get("limit") or page_size
+        if total is None or not results or len(results) >= total:
+            return results
+
+        offsets = list(range(limit, total, limit))
+        sem = asyncio.Semaphore(max(1, parallelism))
+
+        async def fetch_at(offset: int) -> tuple[int, list[dict[str, Any]]]:
+            async with sem:
+                body = await get_page(offset)
+            return offset, list(body.get("data") or [])
+
+        pages = await asyncio.gather(*[fetch_at(o) for o in offsets])
+        for _, page in sorted(pages, key=lambda item: item[0]):
+            results.extend(page)
+        return results
+
+
+# ── Rendering ────────────────────────────────────────────────────────────────
+
+def _stringify(value: Any) -> str:
+    """Render a cell value; nested structures become compact JSON."""
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def emit_table(table: Table) -> None:
+    """Print a result table surrounded by blank lines for readability."""
+    console.print()
+    console.print(table)
+    console.print()
+
+
+def emit_json(data: Any) -> None:
+    """Print result JSON surrounded by blank lines for readability."""
+    console.print()
+    console.print_json(data=data)
+    console.print()
+
+
+def render_table(data: Any, title: str) -> Table:
+    """Turn a JSON object or list of objects into a rich table."""
+    if isinstance(data, list) and data and all(isinstance(r, dict) for r in data):
+        # List of records → one column per key (union, first-seen order).
+        columns: list[str] = []
+        for row in data:
+            for key in row:
+                if key not in columns:
+                    columns.append(key)
+        table = Table(
+            title=title, box=box.ROUNDED, border_style="blue", header_style="bold cyan"
+        )
+        for col in columns:
+            table.add_column(col, style="white")
+        for row in data:
+            table.add_row(*[_stringify(row.get(col)) for col in columns])
+        return table
+
+    table = Table(
+        title=title, box=box.ROUNDED, border_style="blue", header_style="bold cyan"
+    )
+    table.add_column("Field", style="cyan", no_wrap=True)
+    table.add_column("Value", style="white")
+    if isinstance(data, dict):
+        for key, value in data.items():
+            table.add_row(str(key), _stringify(value))
+    else:
+        table.add_row("value", _stringify(data))
+    return table
+
+
+# ── Root callback (global options) ──────────────────────────────────────────────
+
+@app.callback()
+def main(
+    ctx: typer.Context,
+    env: str | None = typer.Option(
+        None, "--env", "-e", help="Named environment saved with `setup` (e.g. TEST)."
+    ),
+    api_url: str | None = typer.Option(
+        None, "--api-url", help="Override the API base URL for this run."
+    ),
+    extension_id: str | None = typer.Option(
+        None, "--extension-id", help="Override the extension id for this run."
+    ),
+    vendor_account_id: str | None = typer.Option(
+        None, "--vendor-account-id", help="Override the vendor account id for this run."
+    ),
+    api_key: str | None = typer.Option(
+        None,
+        "--api-key",
+        help="API key (discouraged: appears in shell history; prefer "
+        f"${API_KEY_ENV}, --api-key-file, --api-key-stdin or the prompt).",
+    ),
+    api_key_file: Path | None = typer.Option(
+        None, "--api-key-file", help="Read the API key from this file."
+    ),
+    api_key_stdin: bool = typer.Option(
+        False, "--api-key-stdin", help="Read the API key from stdin (first line)."
+    ),
+    max_retries: int = typer.Option(
+        DEFAULT_MAX_RETRIES,
+        "--max-retries",
+        min=0,
+        help="Max retries for idempotent requests on transient errors "
+        "(429/502/503/504). POST is never retried.",
+    ),
+    backoff_factor: float = typer.Option(
+        DEFAULT_BACKOFF_FACTOR,
+        "--backoff-factor",
+        min=0.0,
+        help="Exponential backoff factor in seconds: wait = factor * 2**(attempt-1).",
+    ),
+    max_backoff: float = typer.Option(
+        DEFAULT_MAX_BACKOFF,
+        "--max-backoff",
+        min=0.0,
+        help="Cap in seconds on any single backoff wait.",
+    ),
+) -> None:
+    """Resolve global options; individual commands do the work."""
+    ctx.obj = GlobalOpts(
+        env=env,
+        api_url=api_url,
+        extension_id=extension_id,
+        vendor_account_id=vendor_account_id,
+        api_key=api_key,
+        api_key_file=api_key_file,
+        api_key_stdin=api_key_stdin,
+        max_retries=max_retries,
+        backoff_factor=backoff_factor,
+        max_backoff=max_backoff,
+    )
+
+
+# ── setup ────────────────────────────────────────────────────────────────────
+
+@app.command()
+def setup(
+    ctx: typer.Context,
+    api_url: str | None = typer.Option(None, "--api-url", help="API base URL."),
+    extension_id: str | None = typer.Option(None, "--extension-id", help="Extension id."),
+    vendor_account_id: str | None = typer.Option(
+        None, "--vendor-account-id", help="Vendor account id."
+    ),
+    set_default: bool = typer.Option(
+        False, "--default", help="Also make this the default environment."
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        "-y",
+        help="Overwrite an existing environment without confirmation.",
+    ),
+) -> None:
+    """Save api_url, extension id and vendor account id for an environment.
+
+    The environment name is the config key: reusing an existing name overwrites
+    it (with confirmation). The API key is never saved. Example:
+
+      cspext --env TEST setup --api-url https://api.example.com \\
+          --extension-id EXT-123 --vendor-account-id VA-456 --default
+    """
+    opts: GlobalOpts = ctx.obj
+    env_name = opts.env or typer.prompt("Environment name (e.g. TEST)").strip()
+    if not env_name:
+        raise typer.BadParameter("An environment name is required.")
+
+    cfg = load_config()
+    envs = _environments(cfg)
+    existing = envs.get(env_name, {})
+
+    if existing and not force:
+        if not sys.stdin.isatty():
+            raise typer.BadParameter(
+                f"Environment '{env_name}' already exists. "
+                "Re-run with --force to overwrite it."
+            )
+        console.print(
+            f"[yellow]Environment [bold]{env_name}[/bold] already exists:[/yellow] "
+            f"api_url={existing.get('api_url')}, "
+            f"extension_id={existing.get('extension_id')}, "
+            f"vendor_account_id={existing.get('vendor_account_id')}"
+        )
+        typer.confirm(f"Overwrite environment '{env_name}'?", abort=True)
+
+    api_url = api_url or opts.api_url or typer.prompt(
+        "API base URL", default=existing.get("api_url", "")
+    ).strip()
+    extension_id = extension_id or opts.extension_id or typer.prompt(
+        "Extension id", default=existing.get("extension_id", "")
+    ).strip()
+    vendor_account_id = vendor_account_id or opts.vendor_account_id or typer.prompt(
+        "Vendor account id", default=existing.get("vendor_account_id", "")
+    ).strip()
+
+    if not (api_url and extension_id and vendor_account_id):
+        raise typer.BadParameter(
+            "api_url, extension_id and vendor_account_id are all required."
+        )
+
+    envs[env_name] = {
+        "api_url": api_url.rstrip("/"),
+        "extension_id": extension_id,
+        "vendor_account_id": vendor_account_id,
+    }
+    if set_default or cfg.get("default_env") is None:
+        cfg["default_env"] = env_name
+
+    save_config(cfg)
+    console.print(
+        f"[green]Saved environment [bold]{env_name}[/bold][/green]"
+        f" → {_config_file()}"
+    )
+    if cfg.get("default_env") == env_name:
+        console.print(f"[dim]'{env_name}' is the default environment.[/dim]")
+
+
+# ── config show / list ─────────────────────────────────────────────────────────
+
+@app.command("config")
+def config_show(ctx: typer.Context) -> None:
+    """Show saved environments (never displays any API key)."""
+    cfg = load_config()
+    envs = _environments(cfg)
+    if not envs:
+        console.print("[yellow]No environments configured. Run `cspext setup`.[/yellow]")
+        return
+
+    table = Table(
+        title="cspext environments",
+        box=box.ROUNDED,
+        border_style="blue",
+        header_style="bold cyan",
+    )
+    table.add_column("Env", style="cyan", no_wrap=True)
+    table.add_column("API URL", style="white")
+    table.add_column("Extension id", style="white")
+    table.add_column("Vendor account id", style="white")
+    table.add_column("Default", justify="center")
+
+    default_env = cfg.get("default_env")
+    for name in sorted(envs):
+        e = envs[name]
+        table.add_row(
+            name,
+            e.get("api_url", "-"),
+            e.get("extension_id", "-"),
+            e.get("vendor_account_id", "-"),
+            "[green]✓[/green]" if name == default_env else "",
+        )
+    emit_table(table)
+
+
+# ── default (change the default environment) ─────────────────────────────────────
+
+@app.command("default")
+def set_default_env(
+    env_name: str = typer.Argument(
+        ..., metavar="ENV", help="Environment to make the default."
+    ),
+) -> None:
+    """Set the default environment used when --env is not given."""
+    cfg = load_config()
+    envs = _environments(cfg)
+    if env_name not in envs:
+        available = ", ".join(sorted(envs)) or "none"
+        raise typer.BadParameter(
+            f"Environment '{env_name}' is not configured. Available: {available}"
+        )
+    cfg["default_env"] = env_name
+    save_config(cfg)
+    console.print(
+        f"[green]Default environment set to [bold]{env_name}[/bold].[/green]"
+    )
+
+
+# ── check (auth / connectivity health check) ─────────────────────────────────────
+
+@app.command()
+def check(
+    ctx: typer.Context,
+    output: OutputFormat = typer.Option(
+        OutputFormat.TABLE,
+        "--format",
+        "-f",
+        help="Output format for the response.",
+    ),
+) -> None:
+    """Verify the API is reachable and the API key authenticates."""
+    rt = resolve_runtime(ctx.obj)
+    path = _format_path(CHECK_PATH, rt)
+
+    async def _run() -> httpx.Response:
+        return await api_request(rt, "GET", path)
+
+    if output is OutputFormat.TABLE:
+        console.print(
+            f"[dim]GET {rt.api_url}{path}"
+            f"{f' (env {rt.env})' if rt.env else ''}[/dim]"
+        )
+    try:
+        resp = asyncio.run(_run())
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        console.print(f"[bold red]Connection error:[/bold red] {exc}")
+        raise typer.Exit(1)
+
+    if resp.status_code == 401 or resp.status_code == 403:
+        console.print(
+            f"[bold red]Authentication failed[/bold red] (HTTP {resp.status_code})."
+        )
+        raise typer.Exit(1)
+    if resp.status_code >= 400:
+        console.print(
+            f"[bold red]API error {resp.status_code}[/bold red]: {resp.text[:300]}"
+        )
+        raise typer.Exit(1)
+
+    try:
+        data = resp.json()
+    except ValueError:
+        data = None
+
+    if output is OutputFormat.JSON:
+        if data is not None:
+            emit_json(data)
+        elif resp.text:
+            console.print(resp.text[:1000])
+        return
+
+    console.print(f"[bold green]OK[/bold green] (HTTP {resp.status_code})")
+    if isinstance(data, dict):
+        table = Table(
+            title=f"Extension {rt.extension_id}",
+            box=box.ROUNDED,
+            border_style="blue",
+            header_style="bold cyan",
+        )
+        table.add_column("id", style="cyan", no_wrap=True)
+        table.add_column("name", style="white")
+        table.add_column("status", style="white")
+        table.add_row(
+            _stringify(data.get("id")),
+            _stringify(data.get("name")),
+            _stringify(data.get("status")),
+        )
+        emit_table(table)
+    elif data is not None:
+        emit_table(render_table(data, title=f"Extension {rt.extension_id}"))
+    elif resp.text:
+        console.print(resp.text[:1000])
+
+
+# ── list (installations the extension is installed into) ─────────────────────────
+
+INSTALLATIONS_PATH = (
+    "/public/v1/integration/extensions/{extension_id}"
+    "/installations?eq(status,Installed)"
+)
+
+
+@app.command("list")
+def list_installations(
+    ctx: typer.Context,
+    output: OutputFormat = typer.Option(
+        OutputFormat.TABLE,
+        "--format",
+        "-f",
+        help="Output format for the response.",
+    ),
+    parallelism: int = typer.Option(
+        10,
+        "--parallelism",
+        "-p",
+        min=1,
+        max=50,
+        help="Maximum concurrent page requests.",
+    ),
+) -> None:
+    """List the accounts the extension is installed into (status Installed)."""
+    rt = resolve_runtime(ctx.obj)
+    path = _format_path(INSTALLATIONS_PATH, rt)
+
+    try:
+        if output is OutputFormat.TABLE:
+            with console.status("[bold green]Fetching installations…"):
+                installations = asyncio.run(
+                    fetch_all_pages(rt, path, parallelism=parallelism)
+                )
+        else:
+            installations = asyncio.run(
+                fetch_all_pages(rt, path, parallelism=parallelism)
+            )
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        console.print(f"[bold red]Connection error:[/bold red] {exc}")
+        raise typer.Exit(1)
+
+    if output is OutputFormat.JSON:
+        emit_json(installations)
+        return
+
+    if not installations:
+        console.print("[yellow]No installations found.[/yellow]")
+        return
+
+    table = Table(
+        title=f"Installations for {rt.extension_id} ({len(installations)})",
+        box=box.ROUNDED,
+        border_style="blue",
+        header_style="bold cyan",
+    )
+    table.add_column("Account id", style="cyan", no_wrap=True)
+    table.add_column("Name", style="white")
+    table.add_column("Type", style="white")
+    for inst in installations:
+        account = inst.get("account") or {}
+        table.add_row(
+            _stringify(account.get("id")),
+            _stringify(account.get("name")),
+            _stringify(account.get("type")),
+        )
+    emit_table(table)
+
+
+# ── pending (accounts still missing the extension) ──────────────────────────────
+
+AGREEMENTS_PATH = (
+    "/public/v1/commerce/agreements"
+    "?and(out(status,(Terminated,Failed,Deleted)),eq(vendor.id,{vendor_account_id}))"
+)
+
+
+async def compute_pending_clients(
+    rt: Runtime, *, parallelism: int
+) -> list[dict[str, Any]]:
+    """Distinct active-agreement clients minus already-installed accounts."""
+    agreements, installations = await asyncio.gather(
+        fetch_all_pages(rt, _format_path(AGREEMENTS_PATH, rt), parallelism=parallelism),
+        fetch_all_pages(
+            rt, _format_path(INSTALLATIONS_PATH, rt), parallelism=parallelism
+        ),
+    )
+
+    installed_ids = {(inst.get("account") or {}).get("id") for inst in installations}
+    installed_ids.discard(None)
+
+    # Distinct clients across all agreements, first occurrence wins.
+    clients: dict[str, dict[str, Any]] = {}
+    for agreement in agreements:
+        client = agreement.get("client") or {}
+        cid = client.get("id")
+        if cid and cid not in clients:
+            clients[cid] = client
+
+    return [c for cid, c in clients.items() if cid not in installed_ids]
+
+
+@app.command("pending")
+def pending_installations(
+    ctx: typer.Context,
+    output: OutputFormat = typer.Option(
+        OutputFormat.TABLE,
+        "--format",
+        "-f",
+        help="Output format for the response.",
+    ),
+    parallelism: int = typer.Option(
+        10,
+        "--parallelism",
+        "-p",
+        min=1,
+        max=50,
+        help="Maximum concurrent page requests.",
+    ),
+) -> None:
+    """List accounts that have an active agreement but no extension installation.
+
+    Pending = distinct clients across the vendor's active agreements, minus the
+    accounts the extension is already installed into.
+    """
+    rt = resolve_runtime(ctx.obj)
+
+    try:
+        if output is OutputFormat.TABLE:
+            with console.status("[bold green]Fetching agreements and installations…"):
+                pending = asyncio.run(
+                    compute_pending_clients(rt, parallelism=parallelism)
+                )
+        else:
+            pending = asyncio.run(compute_pending_clients(rt, parallelism=parallelism))
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        console.print(f"[bold red]Connection error:[/bold red] {exc}")
+        raise typer.Exit(1)
+
+    if output is OutputFormat.JSON:
+        emit_json(pending)
+        return
+
+    if not pending:
+        console.print(
+            "[green]No pending accounts — every active client has the "
+            "extension installed.[/green]"
+        )
+        return
+
+    table = Table(
+        title=f"Pending installations for {rt.extension_id} ({len(pending)})",
+        box=box.ROUNDED,
+        border_style="blue",
+        header_style="bold cyan",
+    )
+    table.add_column("Client id", style="cyan", no_wrap=True)
+    table.add_column("Name", style="white")
+    for client in pending:
+        table.add_row(_stringify(client.get("id")), _stringify(client.get("name")))
+    emit_table(table)
+
+
+# ── install (install the extension into pending accounts) ────────────────────────
+
+ACCOUNT_MODULES_PATH = "/public/v1/accounts/accounts/{account_id}?select=groups,groups.modules,groups.modules.code"
+CREATE_INSTALLATION_PATH = "/public/v1/integration/installations"
+
+
+def _distinct_module_ids(account_obj: dict[str, Any]) -> list[str]:
+    """Distinct module ids across every group of an account (order preserved)."""
+    ids: list[str] = []
+    seen: set[str] = set()
+    for group in account_obj.get("groups") or []:
+        for module in group.get("modules") or []:
+            mid = module.get("id")
+            if mid and mid not in seen:
+                seen.add(mid)
+                ids.append(mid)
+    return ids
+
+
+async def install_extension_into(
+    rt: Runtime,
+    accounts: list[dict[str, Any]],
+    *,
+    parallelism: int,
+    on_done: Callable[[dict[str, Any]], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Install the extension into each account concurrently.
+
+    Returns one result dict per account: {account, ok, installation|error}.
+    Failures are isolated so one bad account does not abort the batch.
+    `on_done` is invoked with each result as it completes (e.g. to advance a
+    progress bar).
+    """
+    sem = asyncio.Semaphore(max(1, parallelism))
+    async with new_async_client(rt) as client:
+        async def _install(account: dict[str, Any]) -> dict[str, Any]:
+            acc_id = account.get("id")
+            try:
+                modules_resp = await client.request(
+                    "GET", ACCOUNT_MODULES_PATH.format(account_id=acc_id)
+                )
+                if modules_resp.status_code >= 400:
+                    return {
+                        "account": account,
+                        "ok": False,
+                        "error": f"fetch modules: HTTP {modules_resp.status_code} "
+                        f"{modules_resp.text[:200]}",
+                    }
+                module_ids = _distinct_module_ids(modules_resp.json())
+                if not module_ids:
+                    return {
+                        "account": account,
+                        "ok": False,
+                        "error": "no modules found for account",
+                    }
+
+                payload = {
+                    "extension": {"id": rt.extension_id},
+                    "account": {"id": acc_id},
+                    "modules": [{"id": mid} for mid in module_ids],
+                }
+                create_resp = await client.request(
+                    "POST", CREATE_INSTALLATION_PATH, json=payload
+                )
+                if create_resp.status_code >= 400:
+                    return {
+                        "account": account,
+                        "ok": False,
+                        "error": f"create installation: HTTP "
+                        f"{create_resp.status_code} {create_resp.text[:200]}",
+                    }
+                return {
+                    "account": account,
+                    "ok": True,
+                    "installation": create_resp.json(),
+                }
+            except (httpx.ConnectError, httpx.TimeoutException) as exc:
+                return {"account": account, "ok": False, "error": str(exc)}
+
+        async def _one(account: dict[str, Any]) -> dict[str, Any]:
+            async with sem:
+                result = await _install(account)
+            if on_done is not None:
+                on_done(result)
+            return result
+
+        return await asyncio.gather(*[_one(a) for a in accounts])
+
+
+@app.command("install")
+def install(
+    ctx: typer.Context,
+    output: OutputFormat = typer.Option(
+        OutputFormat.TABLE,
+        "--format",
+        "-f",
+        help="Output format for the response.",
+    ),
+    parallelism: int = typer.Option(
+        10,
+        "--parallelism",
+        "-p",
+        min=1,
+        max=50,
+        help="Maximum concurrent requests.",
+    ),
+    include: str | None = typer.Option(
+        None,
+        "--include",
+        help="Comma-separated account ids to install (only these, if pending). "
+        "Applied before --exclude.",
+    ),
+    exclude: str | None = typer.Option(
+        None,
+        "--exclude",
+        help="Comma-separated account ids to skip (e.g. ACC-0101-0101,ACC-2222-2222).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show which accounts would be installed, without changing anything.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the confirmation prompt.",
+    ),
+) -> None:
+    """Install the extension into every pending account.
+
+    Pending accounts are computed as in `pending`. Use --include to restrict to
+    specific accounts, and --exclude to skip some (--include is applied first).
+    """
+    rt = resolve_runtime(ctx.obj)
+    include_ids = {
+        part.strip() for part in (include or "").split(",") if part.strip()
+    }
+    exclude_ids = {
+        part.strip() for part in (exclude or "").split(",") if part.strip()
+    }
+
+    try:
+        with console.status("[bold green]Computing pending accounts…"):
+            pending = asyncio.run(
+                compute_pending_clients(rt, parallelism=parallelism)
+            )
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        console.print(f"[bold red]Connection error:[/bold red] {exc}")
+        raise typer.Exit(1)
+
+    candidates = pending
+    if include_ids:
+        candidates = [c for c in pending if c.get("id") in include_ids]
+        missing = include_ids - {c.get("id") for c in pending}
+        if missing:
+            console.print(
+                "[yellow]Ignoring --include ids that are not pending:[/yellow] "
+                + ", ".join(sorted(missing))
+            )
+
+    targets = [c for c in candidates if c.get("id") not in exclude_ids]
+    skipped = len(candidates) - len(targets)
+
+    if not targets:
+        console.print(
+            "[green]Nothing to install — no pending accounts"
+            f"{f' after excluding {skipped}' if skipped else ''}.[/green]"
+        )
+        return
+
+    if dry_run:
+        table = Table(
+            title=f"[DRY RUN] Would install {rt.extension_id} into {len(targets)} "
+            f"account(s){f', {skipped} excluded' if skipped else ''}",
+            box=box.ROUNDED,
+            border_style="yellow",
+            header_style="bold cyan",
+        )
+        table.add_column("Account id", style="cyan", no_wrap=True)
+        table.add_column("Name", style="white")
+        for client in targets:
+            table.add_row(
+                _stringify(client.get("id")), _stringify(client.get("name"))
+            )
+        emit_table(table)
+        return
+
+    if not yes:
+        if not sys.stdin.isatty():
+            console.print(
+                "[bold red]Refusing to install without confirmation.[/bold red] "
+                "Re-run with --yes (or --dry-run to preview)."
+            )
+            raise typer.Exit(1)
+        console.print(
+            f"About to install [bold]{rt.extension_id}[/bold] into "
+            f"[bold]{len(targets)}[/bold] account(s)"
+            f"{f' ({skipped} excluded)' if skipped else ''}."
+        )
+        typer.confirm("Proceed?", abort=True)
+
+    async def _install_all(
+        on_done: Callable[[dict[str, Any]], None] | None,
+    ) -> list[dict[str, Any]]:
+        return await install_extension_into(
+            rt, targets, parallelism=parallelism, on_done=on_done
+        )
+
+    try:
+        if output is OutputFormat.TABLE:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task(
+                    f"Installing {rt.extension_id}", total=len(targets)
+                )
+                results = asyncio.run(
+                    _install_all(lambda _r: progress.advance(task))
+                )
+        else:
+            results = asyncio.run(_install_all(None))
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        console.print(f"[bold red]Connection error:[/bold red] {exc}")
+        raise typer.Exit(1)
+
+    succeeded = [r for r in results if r.get("ok")]
+    failed = [r for r in results if not r.get("ok")]
+
+    if output is OutputFormat.JSON:
+        emit_json([r["installation"] for r in succeeded])
+    else:
+        if succeeded:
+            table = Table(
+                title=f"Installed {rt.extension_id} into {len(succeeded)} account(s)",
+                box=box.ROUNDED,
+                border_style="green",
+                header_style="bold cyan",
+            )
+            table.add_column("Account id", style="cyan", no_wrap=True)
+            table.add_column("Name", style="white")
+            table.add_column("Installation", style="white")
+            table.add_column("Status", style="white")
+            for r in succeeded:
+                account = r["account"]
+                inst = r.get("installation") or {}
+                table.add_row(
+                    _stringify(account.get("id")),
+                    _stringify(account.get("name")),
+                    _stringify(inst.get("id")),
+                    _stringify(inst.get("status")),
+                )
+            emit_table(table)
+        else:
+            console.print("[yellow]No installations were created.[/yellow]")
+
+    if failed:
+        console.print(f"\n[bold red]{len(failed)} account(s) failed:[/bold red]")
+        for r in failed:
+            console.print(
+                f" - [red]{r['account'].get('id')}[/red] "
+                f"({r['account'].get('name')}): {r.get('error')}"
+            )
+        raise typer.Exit(1)
+
+
+# ── uninstall (remove the extension from installed accounts) ─────────────────────
+
+DELETE_INSTALLATION_PATH = (
+    "/public/v1/integration/installations/{installation_id}"
+)
+
+
+async def uninstall_extension_from(
+    rt: Runtime,
+    installations: list[dict[str, Any]],
+    *,
+    parallelism: int,
+    on_done: Callable[[dict[str, Any]], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Delete each installation concurrently, isolating per-item failures.
+
+    Returns one result dict per installation: {account, installation, ok, error?}.
+    """
+    sem = asyncio.Semaphore(max(1, parallelism))
+    async with new_async_client(rt) as client:
+        async def _delete(inst: dict[str, Any]) -> dict[str, Any]:
+            account = inst.get("account") or {}
+            inst_id = inst.get("id")
+            try:
+                resp = await client.request(
+                    "DELETE",
+                    DELETE_INSTALLATION_PATH.format(installation_id=inst_id),
+                )
+                if resp.status_code >= 400:
+                    return {
+                        "account": account,
+                        "installation": inst,
+                        "ok": False,
+                        "error": f"HTTP {resp.status_code} {resp.text[:200]}",
+                    }
+                return {"account": account, "installation": inst, "ok": True}
+            except (httpx.ConnectError, httpx.TimeoutException) as exc:
+                return {
+                    "account": account,
+                    "installation": inst,
+                    "ok": False,
+                    "error": str(exc),
+                }
+
+        async def _one(inst: dict[str, Any]) -> dict[str, Any]:
+            async with sem:
+                result = await _delete(inst)
+            if on_done is not None:
+                on_done(result)
+            return result
+
+        return await asyncio.gather(*[_one(i) for i in installations])
+
+
+@app.command("uninstall")
+def uninstall(
+    ctx: typer.Context,
+    output: OutputFormat = typer.Option(
+        OutputFormat.TABLE,
+        "--format",
+        "-f",
+        help="Output format for the response.",
+    ),
+    parallelism: int = typer.Option(
+        10,
+        "--parallelism",
+        "-p",
+        min=1,
+        max=50,
+        help="Maximum concurrent requests.",
+    ),
+    include: str | None = typer.Option(
+        None,
+        "--include",
+        help="Comma-separated account ids to uninstall (only these). "
+        "Applied before --exclude.",
+    ),
+    exclude: str | None = typer.Option(
+        None,
+        "--exclude",
+        help="Comma-separated account ids to keep (e.g. ACC-0101-0101,ACC-2222-2222).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show which accounts would be uninstalled, without changing anything.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the confirmation prompt.",
+    ),
+) -> None:
+    """Uninstall the extension from the accounts it is installed into.
+
+    Targets the current installations (status Installed). Use --include to
+    restrict to specific accounts, and --exclude to keep some (--include first).
+    """
+    rt = resolve_runtime(ctx.obj)
+    include_ids = {
+        part.strip() for part in (include or "").split(",") if part.strip()
+    }
+    exclude_ids = {
+        part.strip() for part in (exclude or "").split(",") if part.strip()
+    }
+
+    try:
+        with console.status("[bold green]Fetching installations…"):
+            installations = asyncio.run(
+                fetch_all_pages(
+                    rt, _format_path(INSTALLATIONS_PATH, rt), parallelism=parallelism
+                )
+            )
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        console.print(f"[bold red]Connection error:[/bold red] {exc}")
+        raise typer.Exit(1)
+
+    candidates = installations
+    if include_ids:
+        candidates = [
+            i for i in installations if (i.get("account") or {}).get("id") in include_ids
+        ]
+        present = {(i.get("account") or {}).get("id") for i in installations}
+        missing = include_ids - present
+        if missing:
+            console.print(
+                "[yellow]Ignoring --include ids that are not installed:[/yellow] "
+                + ", ".join(sorted(missing))
+            )
+
+    targets = [
+        i for i in candidates if (i.get("account") or {}).get("id") not in exclude_ids
+    ]
+    skipped = len(candidates) - len(targets)
+
+    if not targets:
+        console.print(
+            "[green]Nothing to uninstall — no matching installations"
+            f"{f' after excluding {skipped}' if skipped else ''}.[/green]"
+        )
+        return
+
+    if dry_run:
+        table = Table(
+            title=f"[DRY RUN] Would uninstall {rt.extension_id} from {len(targets)} "
+            f"account(s){f', {skipped} excluded' if skipped else ''}",
+            box=box.ROUNDED,
+            border_style="yellow",
+            header_style="bold cyan",
+        )
+        table.add_column("Account id", style="cyan", no_wrap=True)
+        table.add_column("Name", style="white")
+        table.add_column("Installation", style="white")
+        for inst in targets:
+            account = inst.get("account") or {}
+            table.add_row(
+                _stringify(account.get("id")),
+                _stringify(account.get("name")),
+                _stringify(inst.get("id")),
+            )
+        emit_table(table)
+        return
+
+    if not yes:
+        if not sys.stdin.isatty():
+            console.print(
+                "[bold red]Refusing to uninstall without confirmation.[/bold red] "
+                "Re-run with --yes (or --dry-run to preview)."
+            )
+            raise typer.Exit(1)
+        console.print(
+            f"About to uninstall [bold]{rt.extension_id}[/bold] from "
+            f"[bold]{len(targets)}[/bold] account(s)"
+            f"{f' ({skipped} excluded)' if skipped else ''}."
+        )
+        typer.confirm("Proceed?", abort=True)
+
+    async def _uninstall_all(
+        on_done: Callable[[dict[str, Any]], None] | None,
+    ) -> list[dict[str, Any]]:
+        return await uninstall_extension_from(
+            rt, targets, parallelism=parallelism, on_done=on_done
+        )
+
+    try:
+        if output is OutputFormat.TABLE:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task(
+                    f"Uninstalling {rt.extension_id}", total=len(targets)
+                )
+                results = asyncio.run(
+                    _uninstall_all(lambda _r: progress.advance(task))
+                )
+        else:
+            results = asyncio.run(_uninstall_all(None))
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        console.print(f"[bold red]Connection error:[/bold red] {exc}")
+        raise typer.Exit(1)
+
+    succeeded = [r for r in results if r.get("ok")]
+    failed = [r for r in results if not r.get("ok")]
+
+    if output is OutputFormat.JSON:
+        emit_json([r["installation"] for r in succeeded])
+    else:
+        if succeeded:
+            table = Table(
+                title=f"Uninstalled {rt.extension_id} from {len(succeeded)} account(s)",
+                box=box.ROUNDED,
+                border_style="green",
+                header_style="bold cyan",
+            )
+            table.add_column("Account id", style="cyan", no_wrap=True)
+            table.add_column("Name", style="white")
+            table.add_column("Installation", style="white")
+            for r in succeeded:
+                account = r["account"]
+                inst = r.get("installation") or {}
+                table.add_row(
+                    _stringify(account.get("id")),
+                    _stringify(account.get("name")),
+                    _stringify(inst.get("id")),
+                )
+            emit_table(table)
+        else:
+            console.print("[yellow]No installations were removed.[/yellow]")
+
+    if failed:
+        console.print(f"\n[bold red]{len(failed)} account(s) failed:[/bold red]")
+        for r in failed:
+            console.print(
+                f" - [red]{r['account'].get('id')}[/red] "
+                f"({r['account'].get('name')}): {r.get('error')}"
+            )
+        raise typer.Exit(1)
+
+
+if __name__ == "__main__":
+    app()

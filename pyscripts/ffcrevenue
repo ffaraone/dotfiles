@@ -1,0 +1,1090 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "httpx>=0.27",
+#     "httpx-retries>=0.3",
+#     "openpyxl>=3.1",
+#     "pyjwt>=2.8",
+#     "python-dateutil>=2.9",
+#     "rich>=13.7",
+#     "typer>=0.12",
+# ]
+# ///
+"""
+Standalone billing report generator for SoftwareOne FinOps for Cloud.
+
+For every organization it reports the monthly spend in its own data currency, the same
+spend converted to the target currency (EUR by default, --currency) and the billed
+amount, that is a configurable percentage of the converted spend. One row per
+organization, sorted from the most to the least billed, with the totals of the whole
+reported range and three columns per month: spending in the organization currency,
+spending in the target currency and billed amount.
+
+Organizations with no expenses in any of the reported months are left out.
+
+A summary sheet totals the spending and the billed amount per month, broken down per
+datasource type (Azure, AWS, Google Cloud), and charts the billed amount over the
+reported periods, in total and per datasource type.
+
+The only data source is the FinOps operations API; trial periods and entitlements are
+not taken into account. Any failure fetching the data aborts the run: a partial report
+would be a wrong report.
+
+This file has no dependency on the extension codebase: copy it anywhere and run it.
+
+    export FFC_OPERATIONS_SECRET=...     # operations API JWT signing secret
+    export EXCHANGE_RATES_API_TOKEN=...  # exchangerate-api.com token
+    uv run billing_report.py --help
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal
+from pathlib import Path
+from typing import Any
+
+import httpx
+import jwt
+import typer
+from dateutil.relativedelta import relativedelta
+from httpx_retries import Retry, RetryTransport
+from openpyxl import Workbook
+from openpyxl.chart import BarChart, Reference
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
+from rich.table import Table
+
+DEFAULT_OPERATIONS_API_BASE_URL = "https://api.finops.softwareone.com/ops/v1"
+DEFAULT_OPERATIONS_SUB = "FTKN-4300-9900"
+DEFAULT_EXCHANGE_RATES_BASE_URL = "https://v6.exchangerate-api.com/v6"
+SECRET_ENV_VAR = "FFC_OPERATIONS_SECRET"
+RATES_TOKEN_ENV_VAR = "EXCHANGE_RATES_API_TOKEN"
+
+REPORT_TITLE = "FinOps for Cloud Billing Report"
+DEFAULT_TARGET_CURRENCY = "EUR"
+CENTS = Decimal("0.01")
+RATE_PRECISION = Decimal("0.0001")
+MONEY_FORMAT = "#,##0.00"
+RATE_FORMAT = "#,##0.0000"
+TOTAL_COLOR = "1F3864"  # aggregate series, kept out of the datasource type colors
+# known datasource types, in the order they appear in the report
+DATASOURCE_TYPES: dict[str, str] = {
+    "azure_cnr": "Azure",
+    "aws_cnr": "AWS",
+    "gcp_cnr": "Google Cloud",
+}
+# one color per datasource type, same order, plus the fallback for unknown types
+DATASOURCE_COLORS = ["2A78D6", "EB6834", "1BAF7A", "EDA100", "E87BA4", "4A3AA7"]
+
+console = Console()
+app = typer.Typer(add_completion=False)
+
+
+def env(name: str) -> str:
+    """Read a secret, accepting both the plain and the ``EXT_`` prefixed name."""
+    for key in (name, f"EXT_{name}"):
+        value = os.environ.get(key)
+        if value:
+            return value
+    raise typer.BadParameter(f"environment variable {name} (or EXT_{name}) is not set")
+
+
+def money(value: Decimal) -> float:
+    return float(value.quantize(CENTS, rounding=ROUND_HALF_UP))
+
+
+def describe_error(error: BaseException) -> str:
+    """Flatten the exception group raised by the task group down to the first failure."""
+    while isinstance(error, BaseExceptionGroup) and error.exceptions:
+        error = error.exceptions[0]
+    return f"{type(error).__name__}: {error}"
+
+
+def format_percentage(percentage: Decimal) -> str:
+    """5.0 -> '5', 2.50 -> '2.5'."""
+    return f"{percentage:f}".rstrip("0").rstrip(".") or "0"
+
+
+def datasource_label(datasource_type: str) -> str:
+    """'azure_cnr' -> 'Azure'; unknown types keep the raw value."""
+    return DATASOURCE_TYPES.get(datasource_type, datasource_type)
+
+
+# --------------------------------------------------------------------------------------
+# billing period
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Period:
+    year: int
+    month: int
+
+    @property
+    def label(self) -> str:
+        return datetime(self.year, self.month, 1).strftime("%b %Y")
+
+    def __str__(self) -> str:
+        return f"{self.year:04d}-{self.month:02d}"
+
+
+def build_periods(year: int, month: int, months: int) -> list[Period]:
+    """Return ``months`` periods, oldest first, ending with ``year``/``month``."""
+    anchor = date(year, month, 1)
+    return [
+        Period(period.year, period.month)
+        for period in (anchor - relativedelta(months=offset) for offset in reversed(range(months)))
+    ]
+
+
+# --------------------------------------------------------------------------------------
+# api clients
+# --------------------------------------------------------------------------------------
+
+
+def build_httpx_client(base_url: str, auth: httpx.Auth | None) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        base_url=base_url,
+        auth=auth,
+        timeout=httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=60.0),
+        # a failed request aborts the whole report, so insist before giving up
+        transport=RetryTransport(
+            retry=Retry(
+                total=10,
+                backoff_factor=1.0,
+                max_backoff_wait=60.0,
+                status_forcelist=[408, 425, 429, 500, 502, 503, 504],
+            )
+        ),
+    )
+
+
+class FFCOpsAuth(httpx.Auth):
+    """Short lived JWT, regenerated when the API answers 401."""
+
+    requires_response_body = True
+
+    def __init__(self, sub: str, secret: str):
+        self.sub = sub
+        self.secret = secret
+        self.jwt_token = self.generate_jwt_token()
+
+    def generate_jwt_token(self) -> str:
+        now = datetime.now(UTC)
+        return jwt.encode(
+            {"sub": self.sub, "exp": now + timedelta(minutes=5), "nbf": now, "iat": now},
+            self.secret,
+            algorithm="HS256",
+        )
+
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        request.headers["Authorization"] = f"Bearer {self.jwt_token}"
+        response = yield request
+        if response.status_code == 401:
+            self.jwt_token = self.generate_jwt_token()
+            request.headers["Authorization"] = f"Bearer {self.jwt_token}"
+            yield request
+
+
+class FFCClient:
+    """Minimal async client for the FinOps for Cloud operations API."""
+
+    def __init__(self, base_url: str, sub: str, secret: str, page_size: int = 100):
+        self.page_size = page_size
+        self.client = build_httpx_client(base_url, FFCOpsAuth(sub, secret))
+
+    async def close(self) -> None:
+        await self.client.aclose()
+
+    async def _iterate(self, endpoint: str, rql: str = "") -> AsyncGenerator[dict[str, Any], None]:
+        offset = 0
+        while True:
+            response = await self.client.get(
+                f"{endpoint}?{rql}&limit={self.page_size}&offset={offset}"
+            )
+            response.raise_for_status()
+            payload = response.json()
+            for item in payload["items"]:
+                yield item
+            if payload["total"] <= self.page_size + offset:
+                break
+            offset += self.page_size
+
+    def fetch_organizations(self) -> AsyncGenerator[dict[str, Any], None]:
+        return self._iterate("/organizations")
+
+    def fetch_expenses(
+        self, organization_id: str, period: Period
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        rql = (
+            "and("
+            f"eq(organization.id,{organization_id}),"
+            f"eq(year,{period.year}),"
+            f"eq(month,{period.month}),"
+            "eq(events.deleted.at,null())"
+            ")"
+            "&order_by(linked_datasource_id)"
+        )
+        return self._iterate("/expenses", rql)
+
+
+class ExchangeRatesClient:
+    """Fetches and caches the conversion rates towards the target currency."""
+
+    def __init__(self, base_url: str, token: str, target_currency: str):
+        self.token = token
+        self.target_currency = target_currency
+        self.client = build_httpx_client(base_url, None)
+        self._cache: dict[str, Decimal] = {target_currency: Decimal("1")}
+        self._tasks: dict[str, asyncio.Task[Decimal]] = {}
+        self._lock = asyncio.Lock()
+
+    async def close(self) -> None:
+        await self.client.aclose()
+
+    async def _fetch_rate(self, currency: str) -> Decimal:
+        response = await self.client.get(f"{self.token}/latest/{currency}")
+        response.raise_for_status()
+        rates = response.json().get("conversion_rates") or {}
+        if self.target_currency not in rates:
+            raise RuntimeError(
+                f"no {self.target_currency} conversion rate available for {currency}"
+            )
+        rate = Decimal(str(rates[self.target_currency])).quantize(RATE_PRECISION)
+        self._cache[currency] = rate
+        return rate
+
+    async def rate_to_target(self, currency: str) -> Decimal:
+        """One request per currency, shared by every organization using it."""
+        if currency in self._cache:
+            return self._cache[currency]
+        async with self._lock:
+            task = self._tasks.get(currency)
+            if task is None:
+                task = asyncio.create_task(self._fetch_rate(currency))
+                self._tasks[currency] = task
+        return await task
+
+    @property
+    def used_rates(self) -> dict[str, Decimal]:
+        return dict(self._cache)
+
+
+# --------------------------------------------------------------------------------------
+# report data
+# --------------------------------------------------------------------------------------
+
+
+@dataclass
+class OrganizationRow:
+    organization_id: str
+    name: str
+    operations_external_id: str
+    currency: str
+    exchange_rate: Decimal = Decimal("1")
+    # str(period) -> monthly spend in the organization data currency
+    spend: dict[str, Decimal] = field(default_factory=dict)
+    # str(period) -> monthly spend in EUR
+    spend_converted: dict[str, Decimal] = field(default_factory=dict)
+    # str(period) -> billed amount in EUR
+    billed: dict[str, Decimal] = field(default_factory=dict)
+    # str(period) -> datasource type -> monthly spend in EUR
+    spend_converted_by_type: dict[str, dict[str, Decimal]] = field(default_factory=dict)
+
+    @property
+    def total_spend_converted(self) -> Decimal:
+        return sum(self.spend_converted.values(), Decimal("0"))
+
+    @property
+    def total_billed(self) -> Decimal:
+        return sum(self.billed.values(), Decimal("0"))
+
+    @property
+    def datasource_types(self) -> set[str]:
+        return {
+            datasource_type
+            for by_type in self.spend_converted_by_type.values()
+            for datasource_type in by_type
+        }
+
+
+class ReportBuilder:
+    def __init__(
+        self,
+        ffc: FFCClient,
+        rates: ExchangeRatesClient,
+        periods: list[Period],
+        percentage: Decimal,
+        concurrency: int,
+    ):
+        self.ffc = ffc
+        self.rates = rates
+        self.periods = periods
+        self.percentage = percentage
+        self.semaphore = asyncio.Semaphore(concurrency)
+        self.rows: list[OrganizationRow] = []
+        self.skipped = 0  # organizations with no expenses in any of the reported months
+
+    async def close(self) -> None:
+        await asyncio.gather(self.ffc.close(), self.rates.close())
+
+    async def monthly_expenses(self, organization_id: str, period: Period) -> dict[str, Decimal]:
+        """
+        Spend of the month per datasource type, in the organization data currency.
+
+        The expenses endpoint returns, per datasource, the cumulative spend at each day
+        of the month, so the monthly total of a datasource is its value on the last day
+        it reported.
+        """
+        latest_by_datasource: dict[str, tuple[int, str, Decimal]] = {}
+        async for row in self.ffc.fetch_expenses(organization_id, period):
+            linked_datasource_id = row["linked_datasource_id"]
+            day = int(row["day"])
+            known_day, _, _ = latest_by_datasource.get(linked_datasource_id, (-1, "", Decimal("0")))
+            if day > known_day:
+                latest_by_datasource[linked_datasource_id] = (
+                    day,
+                    row.get("linked_datasource_type") or "unknown",
+                    Decimal(str(row["total_expenses"])),
+                )
+        by_type: dict[str, Decimal] = {}
+        for _, datasource_type, amount in latest_by_datasource.values():
+            by_type[datasource_type] = by_type.get(datasource_type, Decimal("0")) + amount
+        return by_type
+
+    async def process_organization(self, organization: dict[str, Any]) -> None:
+        async with self.semaphore:
+            currency = organization["currency"]
+            row = OrganizationRow(
+                organization_id=organization["id"],
+                name=organization.get("name") or "",
+                operations_external_id=organization.get("operations_external_id") or "",
+                currency=currency,
+                exchange_rate=await self.rates.rate_to_target(currency),
+            )
+            for period in self.periods:
+                by_type = await self.monthly_expenses(row.organization_id, period)
+                spend = sum(by_type.values(), Decimal("0"))
+                spend_converted = spend * row.exchange_rate
+                row.spend[str(period)] = spend
+                row.spend_converted[str(period)] = spend_converted
+                row.billed[str(period)] = spend_converted * self.percentage / Decimal(100)
+                row.spend_converted_by_type[str(period)] = {
+                    datasource_type: amount * row.exchange_rate
+                    for datasource_type, amount in by_type.items()
+                    if amount
+                }
+            if not row.total_spend_converted:  # nothing to bill in any of the reported months
+                self.skipped += 1
+                return
+            self.rows.append(row)
+
+    async def run(self, organization_ids: list[str] | None) -> None:
+        with console.status("[cyan]fetching organizations..."):
+            organizations = [organization async for organization in self.ffc.fetch_organizations()]
+        if organization_ids:
+            wanted = set(organization_ids)
+            organizations = [o for o in organizations if o["id"] in wanted]
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("computing billed amounts", total=len(organizations))
+
+            async def worker(organization: dict[str, Any]) -> None:
+                await self.process_organization(organization)
+                progress.advance(task)
+
+            # any failure aborts the report: partial data would be wrong data
+            async with asyncio.TaskGroup() as group:
+                for organization in organizations:
+                    group.create_task(worker(organization))
+
+        self.rows.sort(key=lambda row: row.total_billed, reverse=True)
+        if self.skipped:
+            console.print(
+                f"[dim]{self.skipped} organization(s) without expenses in the reported "
+                "months excluded"
+            )
+
+
+# --------------------------------------------------------------------------------------
+# excel output
+# --------------------------------------------------------------------------------------
+
+TITLE_FILL = PatternFill("solid", fgColor="1F3864")
+TITLE_FONT = Font(bold=True, size=16, color="FFFFFF")
+HEADER_FILL = PatternFill("solid", fgColor="2E5496")
+HEADER_FONT = Font(bold=True, size=12, color="FFFFFF")
+HEADER_BORDER = Border(bottom=Side(style="medium", color="1F3864"))
+TOTAL_FILL = PatternFill("solid", fgColor="DCE3F0")
+TOTAL_FONT = Font(bold=True, size=11)
+TOTAL_BORDER = Border(top=Side(style="thin", color="1F3864"))
+SUBHEADER_FILL = PatternFill("solid", fgColor="4472C4")  # the month sub labels
+EMPHASIS_FILL = PatternFill("solid", fgColor="F2F5FA")  # the range total columns
+MONTH_FILL = PatternFill("solid", fgColor="F2F6FC")  # every other month, to tell them apart
+MONTH_RULE = Side(style="medium", color="8EAADB")  # between months, over the data rows
+MONTH_HEADER_RULE = Side(style="medium", color="FFFFFF")  # the same, over the header rows
+CHART_WIDTH_CM = 18
+CHART_HEIGHT_CM = 8
+DEFAULT_COLUMN_WIDTH = 8.43  # characters, what Excel gives a column nobody sized
+PIXELS_PER_CM = 37.795
+TITLE_ROW = 1
+HEADER_ROW = 2
+FIRST_DATA_ROW = HEADER_ROW + 1
+RATE_COLUMN = 5  # id, name, operations_external_id, currency
+FIRST_MONEY_COLUMN = RATE_COLUMN + 1  # range totals, then three columns per month
+RANGE_TOTAL_COLUMNS = 2  # total spending and total billed of the whole reported range
+FIRST_PERIOD_COLUMN = FIRST_MONEY_COLUMN + RANGE_TOTAL_COLUMNS
+
+
+def write_title(
+    sheet, columns: int, periods: list[Period], currency: str, text_columns: int | None = None
+) -> None:
+    """
+    Title banner over ``columns``, above the header row.
+
+    The band is painted over every column but the text is merged over ``text_columns``
+    only: on a sheet with frozen columns that keeps the title still while the rest of
+    the sheet scrolls under the same, uniform band.
+    """
+    span = f"{periods[0].label} - {periods[-1].label}" if len(periods) > 1 else periods[0].label
+    for column in range(1, columns + 1):  # the band has to cover the merged range
+        sheet.cell(row=TITLE_ROW, column=column).fill = TITLE_FILL
+    cell = sheet.cell(row=TITLE_ROW, column=1, value=f"{REPORT_TITLE}  |  {span}  |  {currency}")
+    cell.font = TITLE_FONT
+    cell.alignment = Alignment(horizontal="center", vertical="center")
+    merge_to = min(text_columns or columns, columns)
+    if merge_to > 1:
+        sheet.merge_cells(
+            start_row=TITLE_ROW, start_column=1, end_row=TITLE_ROW, end_column=merge_to
+        )
+    sheet.row_dimensions[TITLE_ROW].height = 34
+
+
+def chart_column_span(sheet, first_column: int) -> int:
+    """How many columns a chart anchored at ``first_column`` covers, at their widths."""
+    remaining, span = CHART_WIDTH_CM, 0
+    while remaining > 0:
+        dimension = sheet.column_dimensions.get(get_column_letter(first_column + span))
+        width = dimension.width if dimension and dimension.width else DEFAULT_COLUMN_WIDTH
+        remaining -= (7 * width + 5) / PIXELS_PER_CM
+        span += 1
+    return span
+
+
+def add_left_rule(cell, side: Side) -> None:
+    """Vertical rule on the left of a cell, keeping the borders it already carries."""
+    cell.border = Border(
+        left=side, right=cell.border.right, top=cell.border.top, bottom=cell.border.bottom
+    )
+
+
+def style_header(
+    sheet,
+    columns: int,
+    row: int = HEADER_ROW,
+    fill: PatternFill = HEADER_FILL,
+    wrap: bool = True,
+    height: int = 46,
+    rule: bool = True,
+) -> None:
+    for column in range(1, columns + 1):
+        cell = sheet.cell(row=row, column=column)
+        cell.fill = fill
+        cell.font = HEADER_FONT
+        if rule:  # the rule closes the header block, so only its last row gets it
+            cell.border = HEADER_BORDER
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=wrap)
+    sheet.row_dimensions[row].height = height
+
+
+def fit_width(text: str, minimum: int) -> float:
+    """Column width that fits a bold 12pt header label without wrapping it."""
+    return max(minimum, len(text) * 1.25 + 3)
+
+
+def style_total_row(sheet, columns: int) -> None:
+    """Bold, filled and ruled off from the rows above: the total row of a table."""
+    for column in range(1, columns + 1):
+        cell = sheet.cell(row=sheet.max_row, column=column)
+        cell.font = TOTAL_FONT
+        cell.fill = TOTAL_FILL
+        cell.border = TOTAL_BORDER
+    sheet.row_dimensions[sheet.max_row].height = 20
+
+
+def set_widths(sheet, widths: list[int]) -> None:
+    for index, width in enumerate(widths, start=1):
+        sheet.column_dimensions[get_column_letter(index)].width = width
+
+
+def period_total(rows: list[OrganizationRow], amounts: str, period: Period) -> Decimal:
+    """Sum one of the amount mappings of every organization for a single period."""
+    key = str(period)
+    return sum((getattr(row, amounts).get(key, Decimal("0")) for row in rows), Decimal("0"))
+
+
+def type_period_total(rows: list[OrganizationRow], datasource_type: str, period: Period) -> Decimal:
+    """Spend in EUR of a single datasource type over every organization, for one period."""
+    key = str(period)
+    return sum(
+        (
+            row.spend_converted_by_type.get(key, {}).get(datasource_type, Decimal("0"))
+            for row in rows
+        ),
+        Decimal("0"),
+    )
+
+
+def present_datasource_types(rows: list[OrganizationRow]) -> list[str]:
+    """The datasource types with expenses, known ones first, in report order."""
+    present = {datasource_type for row in rows for datasource_type in row.datasource_types}
+    known = [datasource_type for datasource_type in DATASOURCE_TYPES if datasource_type in present]
+    return known + sorted(present - set(DATASOURCE_TYPES))
+
+
+def add_monthly_chart(
+    sheet,
+    title: str,
+    columns: list[int],
+    periods: list[Period],
+    colors: list[str],
+    currency: str,
+) -> BarChart:
+    """Clustered column chart of one or more measures over the reported periods."""
+    chart = BarChart()
+    chart.type = "col"
+    chart.title = title
+    chart.y_axis.title = currency
+    chart.x_axis.delete = False  # openpyxl defaults would hide the axes in Excel
+    chart.y_axis.delete = False
+    chart.gapWidth = 60
+    chart.height = CHART_HEIGHT_CM
+    chart.width = CHART_WIDTH_CM
+    last_row = HEADER_ROW + len(periods)
+    for column in columns:
+        chart.add_data(
+            Reference(sheet, min_col=column, min_row=HEADER_ROW, max_row=last_row),
+            titles_from_data=True,
+        )
+    chart.set_categories(Reference(sheet, min_col=1, min_row=FIRST_DATA_ROW, max_row=last_row))
+    for series, color in zip(chart.series, colors):
+        series.graphicalProperties.solidFill = color
+        series.graphicalProperties.line.noFill = True
+    if len(columns) < 2:
+        chart.legend = None  # one series, the title names it
+    else:
+        chart.legend.position = "b"
+        chart.legend.overlay = False
+    return chart
+
+
+def write_summary_sheet(
+    sheet,
+    periods: list[Period],
+    rows: list[OrganizationRow],
+    percentage: Decimal,
+    currency: str,
+) -> None:
+    """
+    Monthly totals: spending and billed amount, broken down per datasource type.
+
+    Layout: month | spending per type... | total spending | billed per type... | total billed.
+    """
+    types = present_datasource_types(rows)
+    billed_label = f"billed {format_percentage(percentage)}% ({currency})"
+    headers = ["Month"]
+    headers += [f"{datasource_label(t)} spending ({currency})" for t in types]
+    headers.append(f"Total spending ({currency})")
+    headers += [f"{datasource_label(t)} {billed_label}" for t in types]
+    headers.append(f"Total {billed_label}")
+
+    # the charts sit one column to the right of the table: the title band covers both
+    chart_column = len(headers) + 2
+    set_widths(sheet, [16] + [20] * (len(headers) - 1))
+    write_title(sheet, chart_column + chart_column_span(sheet, chart_column) - 1, periods, currency)
+    sheet.append(headers)
+    style_header(sheet, len(headers))
+
+    factor = percentage / Decimal(100)
+    for period in periods:
+        spend_by_type = [
+            type_period_total(rows, datasource_type, period) for datasource_type in types
+        ]
+        values: list[Any] = [period.label]
+        values += [money(spend) for spend in spend_by_type]
+        values.append(money(period_total(rows, "spend_converted", period)))
+        values += [money(spend * factor) for spend in spend_by_type]
+        values.append(money(period_total(rows, "billed", period)))
+        sheet.append(values)
+
+    total_spend_by_type = [
+        sum((type_period_total(rows, datasource_type, period) for period in periods), Decimal("0"))
+        for datasource_type in types
+    ]
+    totals: list[Any] = ["TOTAL"]
+    totals += [money(spend) for spend in total_spend_by_type]
+    totals.append(money(sum((row.total_spend_converted for row in rows), Decimal("0"))))
+    totals += [money(spend * factor) for spend in total_spend_by_type]
+    totals.append(money(sum((row.total_billed for row in rows), Decimal("0"))))
+    sheet.append(totals)
+    style_total_row(sheet, len(headers))
+
+    for excel_row in sheet.iter_rows(min_row=FIRST_DATA_ROW, min_col=2):
+        for cell in excel_row:
+            cell.number_format = MONEY_FORMAT
+    for excel_row in sheet.iter_rows(min_row=FIRST_DATA_ROW, max_col=1):
+        for cell in excel_row:
+            cell.font = Font(bold=True)
+
+    # rows only: freezing the month column would tear the title band while scrolling
+    sheet.freeze_panes = sheet.cell(row=FIRST_DATA_ROW, column=1).coordinate
+
+    total_billed_column = len(headers)
+    anchor_column = get_column_letter(chart_column)
+    sheet.add_chart(
+        add_monthly_chart(
+            sheet,
+            f"Billed per month ({format_percentage(percentage)}% of spending)",
+            [total_billed_column],
+            periods,
+            [TOTAL_COLOR],
+            currency,
+        ),
+        f"{anchor_column}{HEADER_ROW + 2}",
+    )
+    if len(types) > 1:  # with a single datasource type the chart above says it all
+        first_billed_column = 2 + len(types) + 1
+        sheet.add_chart(
+            add_monthly_chart(
+                sheet,
+                "Billed per month by datasource type",
+                list(range(first_billed_column, first_billed_column + len(types))),
+                periods,
+                DATASOURCE_COLORS,
+                currency,
+            ),
+            f"{anchor_column}{HEADER_ROW + 19}",
+        )
+
+
+def write_workbook(
+    path: Path,
+    periods: list[Period],
+    rows: list[OrganizationRow],
+    percentage: Decimal,
+    rates: dict[str, Decimal],
+    skipped: int,
+    currency: str,
+) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Billing"
+
+    billed_label = f"Billed {format_percentage(percentage)}% ({currency})"
+    total_billed_label = f"Total billed {format_percentage(percentage)}% ({currency})"
+    # (label, minimum width) of the columns describing the organization and its totals,
+    # spanning both header rows
+    leading = [
+        ("ID", 18),
+        ("Name", 46),
+        ("Operations External ID", 24),
+        ("Currency", 12),
+        (f"Rate to {currency}", 14),
+        (f"Total spending ({currency})", 20),
+        (total_billed_label, 20),
+    ]
+    # the three columns repeated for every month, under the month name
+    monthly = ["Spending", f"Spending ({currency})", billed_label]
+    columns = len(leading) + 3 * len(periods)
+    group_row, label_row = HEADER_ROW, HEADER_ROW + 1
+    first_data_row = label_row + 1
+
+    # the leading columns are frozen: merging the title over them only keeps it still
+    write_title(sheet, columns, periods, currency, text_columns=len(leading))
+    for index, (label, _) in enumerate(leading, start=1):
+        sheet.cell(row=group_row, column=index, value=label)
+        sheet.merge_cells(
+            start_row=group_row, start_column=index, end_row=label_row, end_column=index
+        )
+    column = len(leading) + 1
+    for period in periods:
+        sheet.cell(row=group_row, column=column, value=period.label)
+        sheet.merge_cells(
+            start_row=group_row, start_column=column, end_row=group_row, end_column=column + 2
+        )
+        for offset, label in enumerate(monthly):
+            sheet.cell(row=label_row, column=column + offset, value=label)
+        column += 3
+    style_header(sheet, columns, row=group_row, wrap=False, height=24, rule=False)
+    style_header(sheet, columns, row=label_row, fill=SUBHEADER_FILL, wrap=False, height=24)
+
+    for row in rows:  # already sorted from the most to the least billed
+        values: list[Any] = [
+            row.organization_id,
+            row.name,
+            row.operations_external_id,
+            row.currency,
+            float(row.exchange_rate),
+            money(row.total_spend_converted),
+            money(row.total_billed),
+        ]
+        for period in periods:
+            key = str(period)
+            values.append(money(row.spend.get(key, Decimal("0"))))
+            values.append(money(row.spend_converted.get(key, Decimal("0"))))
+            values.append(money(row.billed.get(key, Decimal("0"))))
+        sheet.append(values)
+
+    if rows:
+        totals: list[Any] = ["", "TOTAL", "", "", ""]
+        totals.append(money(sum((row.total_spend_converted for row in rows), Decimal("0"))))
+        totals.append(money(sum((row.total_billed for row in rows), Decimal("0"))))
+        for period in periods:
+            totals.append(None)  # spend in mixed currencies cannot be summed
+            totals.append(money(period_total(rows, "spend_converted", period)))
+            totals.append(money(period_total(rows, "billed", period)))
+        sheet.append(totals)
+        style_total_row(sheet, columns)
+
+    for excel_row in sheet.iter_rows(min_row=first_data_row, min_col=FIRST_MONEY_COLUMN):
+        for cell in excel_row:
+            cell.number_format = MONEY_FORMAT
+    for excel_row in sheet.iter_rows(
+        min_row=first_data_row, min_col=RATE_COLUMN, max_col=RATE_COLUMN
+    ):
+        for cell in excel_row:
+            cell.number_format = RATE_FORMAT
+    last_data_row = label_row + len(rows)
+    for excel_row in sheet.iter_rows(  # the range totals are the columns to read first
+        min_row=first_data_row,
+        max_row=last_data_row,
+        min_col=FIRST_MONEY_COLUMN,
+        max_col=FIRST_PERIOD_COLUMN - 1,
+    ):
+        for cell in excel_row:
+            cell.fill = EMPHASIS_FILL
+            cell.font = Font(bold=True)
+
+    for index in range(len(periods)):  # tell the months apart: a rule and a light tint
+        first_column = FIRST_PERIOD_COLUMN + 3 * index
+        for excel_row in range(group_row, sheet.max_row + 1):
+            add_left_rule(
+                sheet.cell(row=excel_row, column=first_column),
+                MONTH_HEADER_RULE if excel_row <= label_row else MONTH_RULE,
+            )
+        if index % 2:
+            for excel_row in sheet.iter_rows(
+                min_row=first_data_row,
+                max_row=last_data_row,
+                min_col=first_column,
+                max_col=first_column + 2,
+            ):
+                for cell in excel_row:
+                    cell.fill = MONTH_FILL
+
+    set_widths(
+        sheet,
+        [fit_width(label, minimum) for label, minimum in leading]
+        + [fit_width(label, 14) for label in monthly] * len(periods),
+    )
+    sheet.freeze_panes = sheet.cell(row=first_data_row, column=FIRST_PERIOD_COLUMN).coordinate
+    sheet.auto_filter.ref = f"A{label_row}:{get_column_letter(columns)}{last_data_row}"
+
+    write_summary_sheet(workbook.create_sheet("Summary", 0), periods, rows, percentage, currency)
+
+    info_sheet = workbook.create_sheet("Run Info")
+    write_title(info_sheet, 2, periods, currency)
+    info_sheet.append(["Key", "Value"])
+    style_header(info_sheet, 2)
+    info: list[tuple[str, str]] = [
+        ("Generated at (UTC)", datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")),
+        ("Periods", ", ".join(str(period) for period in periods)),
+        ("Billed percentage", f"{format_percentage(percentage)}%"),
+        ("Target currency", currency),
+        ("Organizations", str(len(rows))),
+        ("Excluded organizations", f"{skipped} with no expenses in the reported months"),
+        ("Trials and entitlements", "not taken into account"),
+        (
+            "Exchange rates",
+            "latest rates at generation time, applied to every period "
+            "(the rates service exposes no historical data)",
+        ),
+    ]
+    for key, value in info:
+        info_sheet.append([key, value])
+    info_sheet.append(["", ""])
+    info_sheet.append(["Currency", f"Rate to {currency}"])
+    for source_currency, rate in sorted(rates.items()):
+        info_sheet.append([source_currency, str(rate)])
+    set_widths(info_sheet, [30, 100])
+    for excel_row in info_sheet.iter_rows(min_row=FIRST_DATA_ROW, min_col=2, max_col=2):
+        for cell in excel_row:
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+    for excel_row in info_sheet.iter_rows(min_row=FIRST_DATA_ROW, max_col=1):
+        for cell in excel_row:
+            cell.font = Font(bold=True)
+
+    workbook.save(path)
+
+
+def build_monthly_table(
+    periods: list[Period], rows: list[OrganizationRow], percentage: Decimal, currency: str
+) -> Table:
+    """Same figures as the Summary sheet: spending and billed amount per month."""
+    table = Table(title=f"Monthly totals ({currency})", header_style="bold cyan")
+    table.add_column("Month")
+    table.add_column("Spending", justify="right")
+    table.add_column(f"Billed {format_percentage(percentage)}%", justify="right", style="green")
+
+    for period in periods:
+        table.add_row(
+            period.label,
+            f"{money(period_total(rows, 'spend_converted', period)):,.2f}",
+            f"{money(period_total(rows, 'billed', period)):,.2f}",
+        )
+
+    if rows:
+        table.add_section()
+        table.add_row(
+            "TOTAL",
+            f"{money(sum((r.total_spend_converted for r in rows), Decimal('0'))):,.2f}",
+            f"{money(sum((r.total_billed for r in rows), Decimal('0'))):,.2f}",
+            style="bold yellow",
+        )
+    return table
+
+
+def build_datasource_table(
+    periods: list[Period], rows: list[OrganizationRow], percentage: Decimal, currency: str
+) -> Table:
+    """Spending and billed amount of the whole reported range, per datasource type."""
+    table = Table(title=f"Totals by datasource type ({currency})", header_style="bold cyan")
+    table.add_column("Datasource type")
+    table.add_column("Spending", justify="right")
+    table.add_column(f"Billed {format_percentage(percentage)}%", justify="right", style="green")
+
+    factor = percentage / Decimal(100)
+    for datasource_type in present_datasource_types(rows):
+        spend = sum(
+            (type_period_total(rows, datasource_type, period) for period in periods), Decimal("0")
+        )
+        table.add_row(
+            datasource_label(datasource_type),
+            f"{money(spend):,.2f}",
+            f"{money(spend * factor):,.2f}",
+        )
+
+    if rows:
+        table.add_section()
+        table.add_row(
+            "TOTAL",
+            f"{money(sum((r.total_spend_converted for r in rows), Decimal('0'))):,.2f}",
+            f"{money(sum((r.total_billed for r in rows), Decimal('0'))):,.2f}",
+            style="bold yellow",
+        )
+    return table
+
+
+def print_summary(
+    periods: list[Period], rows: list[OrganizationRow], percentage: Decimal, currency: str
+) -> None:
+    table = Table(
+        title=(
+            "Top 15 organizations by billed amount "
+            f"({format_percentage(percentage)}% of spend, {currency})"
+        ),
+        header_style="bold cyan",
+    )
+    table.add_column("Name", overflow="fold")
+    table.add_column("Ccy", justify="center")
+    table.add_column("Rate", justify="right")
+    table.add_column("Total spend", justify="right")
+    table.add_column("Total billed", justify="right", style="bold green")
+    for period in periods:
+        table.add_column(f"{period.label} spend", justify="right")
+        table.add_column(f"{period.label} billed", justify="right", style="green")
+
+    for row in rows[:15]:
+        cells = [
+            row.name,
+            row.currency,
+            f"{row.exchange_rate:f}",
+            f"{money(row.total_spend_converted):,.2f}",
+            f"{money(row.total_billed):,.2f}",
+        ]
+        for period in periods:
+            cells.append(f"{money(row.spend_converted.get(str(period), Decimal('0'))):,.2f}")
+            cells.append(f"{money(row.billed.get(str(period), Decimal('0'))):,.2f}")
+        table.add_row(*cells)
+
+    if rows:
+        totals = [
+            "TOTAL",
+            "",
+            "",
+            f"{money(sum((r.total_spend_converted for r in rows), Decimal('0'))):,.2f}",
+            f"{money(sum((r.total_billed for r in rows), Decimal('0'))):,.2f}",
+        ]
+        for period in periods:
+            totals.append(f"{money(period_total(rows, 'spend_converted', period)):,.2f}")
+            totals.append(f"{money(period_total(rows, 'billed', period)):,.2f}")
+        table.add_section()
+        table.add_row(*totals, style="bold yellow")
+
+    console.print(table)
+    console.print(build_monthly_table(periods, rows, percentage, currency))
+    console.print(build_datasource_table(periods, rows, percentage, currency))
+
+
+# --------------------------------------------------------------------------------------
+# cli
+# --------------------------------------------------------------------------------------
+
+
+@app.command()
+def main(
+    months: int = typer.Option(
+        1,
+        "--months",
+        "-m",
+        min=1,
+        max=36,
+        help="Number of months to report, ending at the anchor month.",
+    ),
+    year: int | None = typer.Option(
+        None, "--year", help="Anchor year. Defaults to the previous month."
+    ),
+    month: int | None = typer.Option(
+        None, "--month", min=1, max=12, help="Anchor month. Defaults to the previous month."
+    ),
+    percentage: float = typer.Option(
+        4.0, "--percentage", "-p", help="Percentage of the spend that gets billed."
+    ),
+    currency: str = typer.Option(
+        DEFAULT_TARGET_CURRENCY,
+        "--currency",
+        "-C",
+        help="Currency the spend is converted to and billed in.",
+    ),
+    operations_api_base_url: str = typer.Option(
+        DEFAULT_OPERATIONS_API_BASE_URL,
+        "--operations-api-base-url",
+        help="FinOps operations API base URL.",
+    ),
+    sub: str = typer.Option(
+        DEFAULT_OPERATIONS_SUB, "--sub", help="Subject of the operations API JWT."
+    ),
+    exchange_rates_base_url: str = typer.Option(
+        DEFAULT_EXCHANGE_RATES_BASE_URL,
+        "--exchange-rates-base-url",
+        help="Exchange rates service base URL.",
+    ),
+    organization: list[str] = typer.Option(
+        [], "--organization", "-o", help="Limit the report to these organization IDs."
+    ),
+    concurrency: int = typer.Option(
+        10, "--concurrency", "-c", min=1, max=50, help="Organizations processed in parallel."
+    ),
+    output: Path | None = typer.Option(None, "--output", help="Destination .xlsx file."),
+) -> None:
+    """
+    Generate an Excel report with the monthly spend converted to the target currency and
+    the billed amount for each organization.
+    """
+    target_currency = currency.strip().upper()
+    if len(target_currency) != 3 or not target_currency.isalpha():
+        console.print(f"[red]{currency!r} is not a valid ISO 4217 currency code")
+        raise typer.Exit(1)
+
+    today = date.today()
+    previous_month = today - relativedelta(months=1)
+    anchor_year = year or previous_month.year
+    anchor_month = month or previous_month.month
+    if (anchor_year, anchor_month) > (today.year, today.month):
+        console.print("[red]the billing period cannot be in the future")
+        raise typer.Exit(1)
+
+    periods = build_periods(anchor_year, anchor_month, months)
+    billed_percentage = Decimal(str(percentage))
+    destination = output or Path(f"billing_report_{periods[0]}_{periods[-1]}.xlsx")
+
+    secret = env(SECRET_ENV_VAR)
+    rates_token = env(RATES_TOKEN_ENV_VAR)
+
+    console.print(
+        Panel(
+            f"periods: [bold]{', '.join(str(period) for period in periods)}[/]\n"
+            f"billed percentage: [bold]{format_percentage(billed_percentage)}%[/]\n"
+            f"target currency: [bold]{target_currency}[/]\n"
+            f"operations api: [bold]{operations_api_base_url}[/] (sub {sub})\n"
+            f"output: [bold]{destination}[/]",
+            title="FinOps billing report",
+            border_style="cyan",
+        )
+    )
+
+    builder = ReportBuilder(
+        FFCClient(operations_api_base_url, sub, secret),
+        ExchangeRatesClient(exchange_rates_base_url, rates_token, target_currency),
+        periods,
+        billed_percentage,
+        concurrency,
+    )
+
+    async def run() -> None:
+        try:
+            await builder.run(list(organization) or None)
+        finally:
+            await builder.close()
+
+    try:
+        asyncio.run(run())
+    except Exception as error:  # incomplete data means no report at all
+        console.print(f"[red]failed to fetch the data:[/] {describe_error(error)}")
+        console.print("[red]no report generated")
+        raise typer.Exit(1) from error
+
+    if not builder.rows:
+        console.print("[red]no organization with expenses in the reported periods")
+        raise typer.Exit(1)
+
+    write_workbook(
+        destination,
+        periods,
+        builder.rows,
+        billed_percentage,
+        builder.rates.used_rates,
+        builder.skipped,
+        target_currency,
+    )
+    print_summary(periods, builder.rows, billed_percentage, target_currency)
+    console.print(f"[green]report written to[/] [bold]{destination.resolve()}[/]")
+
+
+if __name__ == "__main__":
+    app()
