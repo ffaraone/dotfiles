@@ -55,7 +55,9 @@ import typer
 from dateutil.relativedelta import relativedelta
 from httpx_retries import Retry, RetryTransport
 from openpyxl import Workbook
-from openpyxl.chart import BarChart, Reference
+from openpyxl.chart import AreaChart, LineChart, Reference
+from openpyxl.chart.marker import Marker
+from openpyxl.chart.shapes import GraphicalProperties
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from rich.console import Console
@@ -448,6 +450,8 @@ EMPHASIS_FILL = PatternFill("solid", fgColor="F2F5FA")  # the range total column
 MONTH_FILL = PatternFill("solid", fgColor="F2F6FC")  # every other month, to tell them apart
 MONTH_RULE = Side(style="medium", color="8EAADB")  # between months, over the data rows
 MONTH_HEADER_RULE = Side(style="medium", color="FFFFFF")  # the same, over the header rows
+LINE_WIDTH_EMU = 28575  # 2.25pt, thin enough to read several series at once
+BAND_EDGE_EMU = 12700  # 1pt, the surface gap between two stacked areas
 CHART_WIDTH_CM = 18
 CHART_HEIGHT_CM = 8
 DEFAULT_COLUMN_WIDTH = 8.43  # characters, what Excel gives a column nobody sized
@@ -574,15 +578,20 @@ def add_monthly_chart(
     periods: list[Period],
     colors: list[str],
     currency: str,
-) -> BarChart:
-    """Clustered column chart of one or more measures over the reported periods."""
-    chart = BarChart()
-    chart.type = "col"
+    stacked: bool = False,
+) -> AreaChart | LineChart:
+    """
+    One measure over the reported periods as a line, a breakdown as stacked areas.
+
+    Stacked areas show that the series add up to a total, which stacked lines only
+    imply.
+    """
+    chart = AreaChart() if stacked else LineChart()
+    chart.grouping = "stacked" if stacked else "standard"
     chart.title = title
     chart.y_axis.title = currency
     chart.x_axis.delete = False  # openpyxl defaults would hide the axes in Excel
     chart.y_axis.delete = False
-    chart.gapWidth = 60
     chart.height = CHART_HEIGHT_CM
     chart.width = CHART_WIDTH_CM
     last_row = HEADER_ROW + len(periods)
@@ -593,8 +602,17 @@ def add_monthly_chart(
         )
     chart.set_categories(Reference(sheet, min_col=1, min_row=FIRST_DATA_ROW, max_row=last_row))
     for series, color in zip(chart.series, colors):
-        series.graphicalProperties.solidFill = color
-        series.graphicalProperties.line.noFill = True
+        if stacked:
+            series.graphicalProperties.solidFill = color
+            series.graphicalProperties.line.solidFill = "FFFFFF"  # a gap between the bands
+            series.graphicalProperties.line.width = BAND_EDGE_EMU
+            continue
+        series.graphicalProperties.line.solidFill = color
+        series.graphicalProperties.line.width = LINE_WIDTH_EMU
+        series.marker = Marker(
+            symbol="circle", size=7, spPr=GraphicalProperties(solidFill=color, ln=None)
+        )
+        series.smooth = False
     if len(columns) < 2:
         chart.legend = None  # one series, the title names it
     else:
@@ -687,6 +705,7 @@ def write_summary_sheet(
                 periods,
                 DATASOURCE_COLORS,
                 currency,
+                stacked=True,
             ),
             f"{anchor_column}{HEADER_ROW + 19}",
         )
