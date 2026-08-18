@@ -83,6 +83,7 @@ DEFAULT_TARGET_CURRENCY = "EUR"
 CENTS = Decimal("0.01")
 RATE_PRECISION = Decimal("0.0001")
 MONEY_FORMAT = "#,##0.00"
+AXIS_FORMAT = "#,##0"
 RATE_FORMAT = "#,##0.0000"
 TOTAL_COLOR = "1F3864"  # aggregate series, kept out of the datasource type colors
 # known datasource types, in the order they appear in the report
@@ -452,6 +453,7 @@ MONTH_RULE = Side(style="medium", color="8EAADB")  # between months, over the da
 MONTH_HEADER_RULE = Side(style="medium", color="FFFFFF")  # the same, over the header rows
 LINE_WIDTH_EMU = 28575  # 2.25pt, thin enough to read several series at once
 BAND_EDGE_EMU = 12700  # 1pt, the surface gap between two stacked areas
+HEADER_HEIGHT = 46
 CHART_WIDTH_CM = 18
 CHART_HEIGHT_CM = 8
 DEFAULT_COLUMN_WIDTH = 8.43  # characters, what Excel gives a column nobody sized
@@ -459,14 +461,19 @@ PIXELS_PER_CM = 37.795
 TITLE_ROW = 1
 HEADER_ROW = 2
 FIRST_DATA_ROW = HEADER_ROW + 1
-RATE_COLUMN = 5  # id, name, operations_external_id, currency
+RATE_COLUMN = 4  # id, name, operations_external_id
 FIRST_MONEY_COLUMN = RATE_COLUMN + 1  # range totals, then three columns per month
 RANGE_TOTAL_COLUMNS = 2  # total spending and total billed of the whole reported range
 FIRST_PERIOD_COLUMN = FIRST_MONEY_COLUMN + RANGE_TOTAL_COLUMNS
 
 
 def write_title(
-    sheet, columns: int, periods: list[Period], currency: str, text_columns: int | None = None
+    sheet,
+    columns: int,
+    periods: list[Period],
+    currency: str,
+    percentage: Decimal,
+    text_columns: int | None = None,
 ) -> None:
     """
     Title banner over ``columns``, above the header row.
@@ -478,7 +485,8 @@ def write_title(
     span = f"{periods[0].label} - {periods[-1].label}" if len(periods) > 1 else periods[0].label
     for column in range(1, columns + 1):  # the band has to cover the merged range
         sheet.cell(row=TITLE_ROW, column=column).fill = TITLE_FILL
-    cell = sheet.cell(row=TITLE_ROW, column=1, value=f"{REPORT_TITLE}  |  {span}  |  {currency}")
+    title = f"{REPORT_TITLE}  |  {span}  |  {currency}  |  {format_percentage(percentage)}%"
+    cell = sheet.cell(row=TITLE_ROW, column=1, value=title)
     cell.font = TITLE_FONT
     cell.alignment = Alignment(horizontal="center", vertical="center")
     merge_to = min(text_columns or columns, columns)
@@ -500,6 +508,19 @@ def chart_column_span(sheet, first_column: int) -> int:
     return span
 
 
+def write_panel_title(sheet, text: str, row: int, column: int, span: int) -> None:
+    """Heading of a chart panel, styled like the header of a table."""
+    cell = sheet.cell(row=row, column=column, value=text)
+    cell.font = HEADER_FONT
+    cell.alignment = Alignment(horizontal="center", vertical="center")
+    for offset in range(span):  # the band has to cover the merged range
+        panel_cell = sheet.cell(row=row, column=column + offset)
+        panel_cell.fill = HEADER_FILL
+        panel_cell.border = HEADER_BORDER
+    sheet.merge_cells(start_row=row, start_column=column, end_row=row, end_column=column + span - 1)
+    sheet.row_dimensions[row].height = HEADER_HEIGHT
+
+
 def add_left_rule(cell, side: Side) -> None:
     """Vertical rule on the left of a cell, keeping the borders it already carries."""
     cell.border = Border(
@@ -513,7 +534,7 @@ def style_header(
     row: int = HEADER_ROW,
     fill: PatternFill = HEADER_FILL,
     wrap: bool = True,
-    height: int = 46,
+    height: int = HEADER_HEIGHT,
     rule: bool = True,
 ) -> None:
     for column in range(1, columns + 1):
@@ -573,7 +594,6 @@ def present_datasource_types(rows: list[OrganizationRow]) -> list[str]:
 
 def add_monthly_chart(
     sheet,
-    title: str,
     columns: list[int],
     periods: list[Period],
     colors: list[str],
@@ -584,12 +604,13 @@ def add_monthly_chart(
     One measure over the reported periods as a line, a breakdown as stacked areas.
 
     Stacked areas show that the series add up to a total, which stacked lines only
-    imply.
+    imply. The chart carries no title of its own: it hangs under a panel heading
+    written on the sheet, see ``write_panel_title``.
     """
     chart = AreaChart() if stacked else LineChart()
     chart.grouping = "stacked" if stacked else "standard"
-    chart.title = title
     chart.y_axis.title = currency
+    chart.y_axis.numFmt = AXIS_FORMAT  # whole units, the cents belong in the table
     chart.x_axis.delete = False  # openpyxl defaults would hide the axes in Excel
     chart.y_axis.delete = False
     chart.height = CHART_HEIGHT_CM
@@ -634,17 +655,18 @@ def write_summary_sheet(
     Layout: month | spending per type... | total spending | billed per type... | total billed.
     """
     types = present_datasource_types(rows)
-    billed_label = f"billed {format_percentage(percentage)}% ({currency})"
+    billed_label = "billed"
     headers = ["Month"]
-    headers += [f"{datasource_label(t)} spending ({currency})" for t in types]
-    headers.append(f"Total spending ({currency})")
+    headers += [f"{datasource_label(t)}" for t in types]
+    headers.append("Total")
     headers += [f"{datasource_label(t)} {billed_label}" for t in types]
     headers.append(f"Total {billed_label}")
 
     # the charts sit one column to the right of the table: the title band covers both
     chart_column = len(headers) + 2
     set_widths(sheet, [16] + [20] * (len(headers) - 1))
-    write_title(sheet, chart_column + chart_column_span(sheet, chart_column) - 1, periods, currency)
+    chart_span = chart_column_span(sheet, chart_column)
+    write_title(sheet, chart_column + chart_span - 1, periods, currency, percentage)
     sheet.append(headers)
     style_header(sheet, len(headers))
 
@@ -684,30 +706,34 @@ def write_summary_sheet(
 
     total_billed_column = len(headers)
     anchor_column = get_column_letter(chart_column)
+    title_row = HEADER_ROW  # level with the table header, so the two read as one band
+    write_panel_title(
+        sheet,
+        "Billed per month",
+        title_row,
+        chart_column,
+        chart_span,
+    )
     sheet.add_chart(
-        add_monthly_chart(
-            sheet,
-            f"Billed per month ({format_percentage(percentage)}% of spending)",
-            [total_billed_column],
-            periods,
-            [TOTAL_COLOR],
-            currency,
-        ),
-        f"{anchor_column}{HEADER_ROW + 2}",
+        add_monthly_chart(sheet, [total_billed_column], periods, [TOTAL_COLOR], currency),
+        f"{anchor_column}{title_row + 1}",
     )
     if len(types) > 1:  # with a single datasource type the chart above says it all
         first_billed_column = 2 + len(types) + 1
+        title_row = HEADER_ROW + 19  # below the first chart, whatever the period count
+        write_panel_title(
+            sheet, "Billed per month by datasource type", title_row, chart_column, chart_span
+        )
         sheet.add_chart(
             add_monthly_chart(
                 sheet,
-                "Billed per month by datasource type",
                 list(range(first_billed_column, first_billed_column + len(types))),
                 periods,
                 DATASOURCE_COLORS,
                 currency,
                 stacked=True,
             ),
-            f"{anchor_column}{HEADER_ROW + 19}",
+            f"{anchor_column}{title_row + 1}",
         )
 
 
@@ -724,27 +750,25 @@ def write_workbook(
     sheet = workbook.active
     sheet.title = "Billing"
 
-    billed_label = f"Billed {format_percentage(percentage)}% ({currency})"
-    total_billed_label = f"Total billed {format_percentage(percentage)}% ({currency})"
     # (label, minimum width) of the columns describing the organization and its totals,
     # spanning both header rows
     leading = [
         ("ID", 18),
         ("Name", 46),
         ("Operations External ID", 24),
-        ("Currency", 12),
         (f"Rate to {currency}", 14),
-        (f"Total spending ({currency})", 20),
-        (total_billed_label, 20),
+        ("Total", 20),
+        ("Billed", 20),
     ]
-    # the three columns repeated for every month, under the month name
-    monthly = ["Spending", f"Spending ({currency})", billed_label]
+    # the three columns repeated for every month, under the month name. The spend in the
+    # organization currency carries its code in the cell format, so it needs no column
+    monthly = ["Original", "Spending", "Billed"]
     columns = len(leading) + 3 * len(periods)
     group_row, label_row = HEADER_ROW, HEADER_ROW + 1
     first_data_row = label_row + 1
 
     # the leading columns are frozen: merging the title over them only keeps it still
-    write_title(sheet, columns, periods, currency, text_columns=len(leading))
+    write_title(sheet, columns, periods, currency, percentage, text_columns=len(leading))
     for index, (label, _) in enumerate(leading, start=1):
         sheet.cell(row=group_row, column=index, value=label)
         sheet.merge_cells(
@@ -767,7 +791,6 @@ def write_workbook(
             row.organization_id,
             row.name,
             row.operations_external_id,
-            row.currency,
             float(row.exchange_rate),
             money(row.total_spend_converted),
             money(row.total_billed),
@@ -780,7 +803,7 @@ def write_workbook(
         sheet.append(values)
 
     if rows:
-        totals: list[Any] = ["", "TOTAL", "", "", ""]
+        totals: list[Any] = ["", "TOTAL", "", ""]
         totals.append(money(sum((row.total_spend_converted for row in rows), Decimal("0"))))
         totals.append(money(sum((row.total_billed for row in rows), Decimal("0"))))
         for period in periods:
@@ -798,6 +821,12 @@ def write_workbook(
     ):
         for cell in excel_row:
             cell.number_format = RATE_FORMAT
+    for offset, row in enumerate(rows):  # the organization currency, spelled in the cell
+        original_format = f'#,##0.00 "{row.currency}"'
+        for index in range(len(periods)):
+            sheet.cell(
+                row=first_data_row + offset, column=FIRST_PERIOD_COLUMN + 3 * index
+            ).number_format = original_format
     last_data_row = label_row + len(rows)
     for excel_row in sheet.iter_rows(  # the range totals are the columns to read first
         min_row=first_data_row,
@@ -837,7 +866,7 @@ def write_workbook(
     write_summary_sheet(workbook.create_sheet("Summary", 0), periods, rows, percentage, currency)
 
     info_sheet = workbook.create_sheet("Run Info")
-    write_title(info_sheet, 2, periods, currency)
+    write_title(info_sheet, 2, periods, currency, percentage)
     info_sheet.append(["Key", "Value"])
     style_header(info_sheet, 2)
     info: list[tuple[str, str]] = [
